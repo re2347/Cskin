@@ -80,7 +80,7 @@ npx wrangler secret put GITCODE_TOKEN
 2026-08-29 已部署 Worker：
 
 - Worker：`cskin-license-staging`
-- Version ID：`64df4fec-616b-4dbc-8a51-cbfd55e6c896`
+- Version ID：`a0fdf3d0-fb1d-4175-a8e8-47d7abec397c`
 - 自定义域名健康检查：`ok=true`、`privateSkinConfigured=true`
 - 未授权索引请求：HTTP 401
 - 已授权索引请求：HTTP 200，8,968 条
