@@ -1,0 +1,25 @@
+name = "cskin-license-local"
+main = "src/index.ts"
+compatibility_date = "2026-08-29"
+compatibility_flags = ["nodejs_compat"]
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+ENVIRONMENT = "local"
+SUPABASE_SYNC_URL = "https://kzqgphxrghdclkwneqyn.supabase.co/functions/v1/auth"
+GITCODE_OWNER = "Re2347"
+GITCODE_REPOSITORY = "skin"
+GITCODE_REF = "main"
+SKIN_REPO_LABEL = "privateskin"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cskin-license-local"
+database_id = "local"
+migrations_dir = "./migrations"

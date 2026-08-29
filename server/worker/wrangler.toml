@@ -1,0 +1,26 @@
+name = "cskin-license-staging"
+main = "src/index.ts"
+compatibility_date = "2026-08-29"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[observability]
+enabled = true
+head_sampling_rate = 1
+
+[triggers]
+crons = ["*/5 * * * *"]
+
+[vars]
+ENVIRONMENT = "staging"
+SUPABASE_SYNC_URL = "https://kzqgphxrghdclkwneqyn.supabase.co/functions/v1/auth"
+GITCODE_OWNER = "Re2347"
+GITCODE_REPOSITORY = "skin"
+GITCODE_REF = "main"
+SKIN_REPO_LABEL = "privateskin"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "cskin-license-staging-db-20260825"
+database_id = "53e2ae82-3dda-4d66-a5a7-b44a73a2526e"
+migrations_dir = "./migrations"
