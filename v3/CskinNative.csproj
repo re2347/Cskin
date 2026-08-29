@@ -1,0 +1,48 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Version>0.3.0</Version>
+    <AssemblyVersion>0.3.0.0</AssemblyVersion>
+    <FileVersion>0.3.0.0</FileVersion>
+    <InformationalVersion>0.3.0</InformationalVersion>
+    <AssemblyName>PortableCskin</AssemblyName>
+    <Product>PortableCskin</Product>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <ApplicationIcon>Assets\cskin.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DefineConstants>$(DefineConstants);CSKIN_AUTH_REQUIRED</DefineConstants>
+    <DebugType>None</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <!-- Keep the host as a normal multi-file release; the bundled engine is
+         also installed as a fixed one-dir tree instead of self-extracting. -->
+    <PublishSingleFile>false</PublishSingleFile>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <StripSymbols>true</StripSymbols>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.Security.Cryptography.ProtectedData" Version="8.0.0" />
+    <PackageReference Include="System.Management" Version="8.0.0" />
+    <!-- Keep temporary harness/build output outside the native app compile graph. -->
+    <Compile Remove="**\obj\**" />
+    <Compile Remove="**\bin\**" />
+    <Compile Remove="tmp-engine-harness-0825\**" />
+    <Content Include="Assets\skin_index.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="Assets\skin_names_zh_CN.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="Assets\champions_zh_CN.json" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="Assets\cskin.ico" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <Content Include="Runtime\Cskin\**\*"
+             Exclude="Runtime\Cskin\__pycache__\**;Runtime\Cskin\data\**;Runtime\Cskin\skins\**;Runtime\Cskin\cskin_engine.py;Runtime\Cskin\selector_assets\**"
+             CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest">
+      <Link>Engine\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </Content>
+    <Content Include="Runtime\wmic.exe" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest">
+      <Link>Engine\wmic.exe</Link>
+    </Content>
+  </ItemGroup>
+</Project>
