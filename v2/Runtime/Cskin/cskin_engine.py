@@ -1011,13 +1011,6 @@ class OverlayApplier:
 
     def apply(self, skin_id: int, record: dict, target_skin_id: int = 0) -> dict:
         apply_started_at = time.time()
-        # Viego forms have repeatedly reached the game loader and then made
-        # the client unresponsive. Quarantine them until a package is tested
-        # against the current game build; never arm an overlay for them.
-        if skin_id // 1000 == 234 and skin_id % 1000 != 0:
-            log(f"Apply rejected: Viego skin safety quarantine skinId={skin_id} "
-                "reason=client-unresponsive-in-game overlayNotStarted=True")
-            raise ApplyError("佛耶戈皮肤已暂时停用，已阻止覆盖层以避免客户端未响应")
         archive = SKINS / str(record.get("relativePath") or "")
         if not archive.is_file():
             log(f"Apply rejected: skin package missing: skinId={skin_id} archive={archive} skinsRoot={SKINS}")

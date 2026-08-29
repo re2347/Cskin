@@ -1175,12 +1175,6 @@ public sealed class MainForm : Form
     {
         var skin = _selectedSkin;
         if (skin is null || !_engine.IsReady) return;
-        if (IsViegoSkin(skin))
-        {
-            AppLog.Warn($"已阻止佛耶戈皮肤应用：skinId={skin.Id}，当前版本会导致客户端未响应");
-            SetStatus(_applyStatus, "佛耶戈皮肤已暂时停用，避免客户端未响应", Palette.Error);
-            return;
-        }
         if (Interlocked.Exchange(ref _applyInFlight, 1) != 0) return;
         AppLog.Info($"收到皮肤应用请求：skinId={skin.Id} repositoryReady={_repository.IsReady} "
             + $"repositorySyncing={_repository.IsSyncing} downloadIfMissing={downloadIfMissing}");
@@ -1278,9 +1272,6 @@ public sealed class MainForm : Form
             || error.Contains("皮肤库中没有", StringComparison.Ordinal)
             || error.Contains("skin package is not cached", StringComparison.OrdinalIgnoreCase);
     }
-
-    private static bool IsViegoSkin(Skin skin) =>
-        skin.ChampionId == 234 || skin.Id / 1000 == 234;
 
     private int ApplicationTargetSkinId(Skin skin)
     {
