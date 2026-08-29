@@ -2,6 +2,7 @@
 param(
     [int]$SkinId = 110003,
     [string]$UntrustedCachePath = "",
+    [switch]$ForceSupabaseFailure,
     [Parameter(Mandatory)]
     [string]$AuthorizationRoot
 )
@@ -42,6 +43,22 @@ try {
 
     $env:CSKIN_DATA_ROOT = $testRoot
     Add-Type -Path $assemblyPath
+    if ($ForceSupabaseFailure) {
+        $repositoryType = [CskinNative.Services.SkinRepository]
+        $endpointField = $repositoryType.GetField(
+            "ResourceEndpoints",
+            [Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Static)
+        if ($null -eq $endpointField) {
+            throw "找不到资源端点字段，无法执行故障切换测试。"
+        }
+        $endpoints = $endpointField.GetValue($null)
+        $endpointType = $endpoints.GetType().GetElementType()
+        $constructor = $endpointType.GetConstructors(
+            [Reflection.BindingFlags]::Public -bor [Reflection.BindingFlags]::NonPublic -bor [Reflection.BindingFlags]::Instance) |
+            Select-Object -First 1
+        $unreachable = $constructor.Invoke(@("supabase", [Uri]"https://127.0.0.1:1/"))
+        $endpoints.SetValue($unreachable, 0)
+    }
     $repository = [CskinNative.Services.SkinRepository]::new($engineRoot)
     $cancellation = [Threading.CancellationTokenSource]::new()
 
@@ -63,13 +80,13 @@ try {
         Copy-Item -LiteralPath $seed -Destination $seedTarget -Force
     }
 
-    # V3 synchronizes the private index through Worker; no local clone starts.
+    # V3 synchronizes the private index through Supabase/Cloudflare; no local clone starts.
     $syncClock = [Diagnostics.Stopwatch]::StartNew()
     $syncTask = $repository.SyncAsync($null, $cancellation.Token)
     $syncOk = $syncTask.GetAwaiter().GetResult()
     $syncClock.Stop()
     if (-not $syncOk) {
-        throw "Worker 私有索引同步失败。"
+        throw "私有资源索引同步失败。"
     }
 
     $downloadClock = [Diagnostics.Stopwatch]::StartNew()
@@ -90,35 +107,45 @@ try {
         throw "下载文件不是有效的 ZIP/fantome：$cached"
     }
     $applicationLog = Get-Content -Raw -LiteralPath (Join-Path $testRoot "logs\application.log")
-    if ($applicationLog -notmatch "Worker 皮肤下载完成") {
-        throw "首次同步期间没有使用私有 Worker 下载。"
+    if ($applicationLog -notmatch "私有皮肤流式下载完成") {
+        throw "首次同步期间没有使用私有资源网关下载。"
     }
     $markerPath = $cached + ".source.json"
     if (-not (Test-Path -LiteralPath $markerPath)) {
         throw "皮肤缓存没有生成来源标记：$markerPath"
     }
     $marker = Get-Content -Raw -LiteralPath $markerPath | ConvertFrom-Json
-    if ($marker.schema -ne "worker-private-v1") {
+    if ($marker.schema -ne "private-gateway-v2") {
         throw "皮肤缓存来源标记版本错误：$($marker.schema)"
     }
     if ($repository.GetCachedSkinPath($SkinId) -ne $cached) {
         throw "下载后的皮肤没有通过来源、大小和 SHA-256 缓存校验。"
     }
-    if ($marker.source -ne "worker-privateskin") {
-        throw "皮肤未使用 privateskin Worker 资源：source=$($marker.source)"
+    if ($marker.source -ne "private-gitcode" -or $marker.upstream -ne "gitcode") {
+        throw "皮肤未使用 privateskin GitCode 资源：source=$($marker.source) upstream=$($marker.upstream)"
+    }
+    $expectedGateway = if ($ForceSupabaseFailure) { "cloudflare" } else { "supabase" }
+    if ($marker.gateway -ne $expectedGateway) {
+        throw "资源故障切换结果错误：gateway=$($marker.gateway) expected=$expectedGateway"
+    }
+    if ($ForceSupabaseFailure -and $applicationLog -notmatch "endpoint=127.0.0.1") {
+        throw "故障注入日志中没有 Supabase 主通道失败记录。"
     }
 
     [PSCustomObject]@{
         TestRoot = $testRoot
         IndexReadySeconds = [math]::Round($indexClock.Elapsed.TotalSeconds, 3)
-        WorkerSyncSeconds = [math]::Round($syncClock.Elapsed.TotalSeconds, 3)
-        WorkerSkinCount = $repository.RemoteSkinCount
+        GatewaySyncSeconds = [math]::Round($syncClock.Elapsed.TotalSeconds, 3)
+        RemoteSkinCount = $repository.RemoteSkinCount
         DownloadedPath = $cached
         DownloadedBytes = $bytes.Length
         DownloadSeconds = [math]::Round($downloadClock.Elapsed.TotalSeconds, 3)
         CacheSource = $marker.source
+        Gateway = $marker.gateway
+        Upstream = $marker.upstream
         Revision = $marker.revision
-        UsedPrivateWorker = $true
+        UsedPrivateGateway = $true
+        ForcedSupabaseFailure = [bool]$ForceSupabaseFailure
         Result = "ok"
     } | Format-List
 }

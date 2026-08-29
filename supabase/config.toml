@@ -1,0 +1,36 @@
+project_id = "kzqgphxrghdclkwneqyn"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "license", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 17
+
+[studio]
+enabled = true
+port = 54323
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
+
+[auth]
+enabled = true
+site_url = "http://127.0.0.1:3000"
+
+[edge_runtime]
+enabled = true
+policy = "oneshot"
+inspector_port = 8083
+
+[functions.auth]
+# The desktop client authenticates with its device signature. Supabase's
+# gateway JWT check is therefore disabled for this function; the function
+# still fails closed without service_role and LICENSE_PEPPER secrets.
+verify_jwt = false

@@ -2,13 +2,17 @@
 
 v3 同一 Worker 还提供受授权租约保护的私有皮肤接口：
 
-- `GET /v1/skins/index`：返回随 Worker 部署的 `privateskin` 路径和名称索引。
-- `GET /v1/skins/file?path=...`：校验路径属于索引后，从 GitCode 私有
+- `GET /v1/skins/index`：返回当前 GitCode revision 对应的 `privateskin` 路径和名称索引。
+- `GET /v1/skins/file?skinId=...`：从索引解析路径后，从 GitCode 私有
   `Re2347/skin` 仓库流式返回单个 `.fantome`。
 
 GitCode 访问令牌必须通过 `npx wrangler secret put GITCODE_TOKEN` 配置，禁止
 写入 `wrangler.jsonc`、`.dev.vars` 的提交版本或客户端。索引更新流程见
 `../../v3/V3-PRIVATE-REPOSITORY.md`。
+
+迁移 `0005_private_skin_catalog_state.sql` 保存动态目录 revision 和覆盖项。
+Worker 每五分钟通过 branch/compare API 增量刷新，因此日常更新 GitCode 仓库后
+无需重新部署 Worker 或客户端。大文件响应保持流式转发，不使用 R2。
 
 这是授权服务的 staging Worker，使用 Cloudflare Workers + D1。客户端只连接 `/v1` API；管理员接口额外要求 `X-Admin-Key`，部署到生产时应再由 Cloudflare Access 保护。
 

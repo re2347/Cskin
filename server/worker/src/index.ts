@@ -126,6 +126,7 @@ interface PrivateSkinIndexItem {
   id: number;
   path: string;
   name?: string;
+  blobSha?: string;
 }
 
 interface PrivateSkinIndex {
@@ -135,6 +136,34 @@ interface PrivateSkinIndex {
   revision: string;
   generatedAt?: string;
   skins: PrivateSkinIndexItem[];
+}
+
+interface PrivateSkinOverride {
+  path?: string;
+  blobSha?: string;
+  deleted?: boolean;
+}
+
+interface PrivateSkinCatalogState {
+  state_id: number;
+  current_revision: string;
+  overrides_json: string;
+  names_json: string | null;
+  last_checked_at: number;
+  updated_at: number;
+  last_error: string | null;
+}
+
+interface GitCodeCompareFile {
+  filename?: string;
+  previous_filename?: string;
+  status?: string;
+  sha?: string;
+}
+
+interface GitCodeCompareResponse {
+  files?: GitCodeCompareFile[];
+  truncated?: boolean;
 }
 
 const BUILT_IN_PRIVATE_SKIN_INDEX: PrivateSkinIndex = privateSkinIndexData;
@@ -151,6 +180,7 @@ const MAX_BODY_BYTES = 64 * 1024;
 const SIGNATURE_CLOCK_SKEW_SECONDS = 5 * 60;
 const REQUEST_NONCE_TTL_SECONDS = 10 * 60;
 const DEVICE_KEY_RECOVERY_COOLDOWN_SECONDS = 7 * 24 * 60 * 60;
+const PRIVATE_SKIN_REFRESH_SECONDS = 5 * 60;
 
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
@@ -461,6 +491,195 @@ async function fetchPrivateRepositoryFile(
   });
 }
 
+function gitCodeApiHeaders(token: string, accept = "application/json"): HeadersInit {
+  return {
+    "PRIVATE-TOKEN": token,
+    "Authorization": `Bearer ${token}`,
+    "User-Agent": "Cskin-Private-Skin-Worker/3.0",
+    "Accept": accept,
+  };
+}
+
+async function readBoundedJson<T>(response: Response, maxBytes: number): Promise<T> {
+  const declaredLength = Number(response.headers.get("content-length") || 0);
+  if (declaredLength > maxBytes) throw new Error("GITCODE_RESPONSE_TOO_LARGE");
+  if (!response.body) throw new Error("GITCODE_RESPONSE_EMPTY");
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel("response too large");
+        throw new Error("GITCODE_RESPONSE_TOO_LARGE");
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const payload = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    payload.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return JSON.parse(new TextDecoder().decode(payload)) as T;
+}
+
+async function fetchGitCodeJson<T>(url: string, token: string): Promise<T> {
+  const response = await fetch(url, { headers: gitCodeApiHeaders(token) });
+  if (!response.ok) throw new Error(`GITCODE_HTTP_${response.status}`);
+  return await readBoundedJson<T>(response, 8 * 1024 * 1024);
+}
+
+function gitCodeBranchUrl(config: { owner: string; repository: string; ref: string }): string {
+  return `https://api.gitcode.com/api/v5/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repository)}/branches/${encodeURIComponent(config.ref)}`;
+}
+
+function gitCodeCompareUrl(config: { owner: string; repository: string }, from: string, to: string): string {
+  return `https://api.gitcode.com/api/v5/repos/${encodeURIComponent(config.owner)}/${encodeURIComponent(config.repository)}/compare/${encodeURIComponent(from)}...${encodeURIComponent(to)}`;
+}
+
+function parseRecord<T>(value: string | null | undefined): Record<string, T> {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, T> : {};
+  } catch {
+    return {};
+  }
+}
+
+function skinIdFromPath(path: string): number | null {
+  if (!isSafeSkinPath(path)) return null;
+  const value = path.split("/").at(-1)?.replace(/\.fantome$/i, "") || "";
+  const skinId = Number(value);
+  return Number.isSafeInteger(skinId) && skinId > 0 ? skinId : null;
+}
+
+async function ensurePrivateSkinCatalogState(db: D1Database): Promise<PrivateSkinCatalogState> {
+  const existing = await db.prepare("SELECT * FROM private_skin_catalog_state WHERE state_id = 1").first<PrivateSkinCatalogState>();
+  if (existing) return existing;
+  const now = nowSeconds();
+  await db.prepare(
+    "INSERT OR IGNORE INTO private_skin_catalog_state (state_id, current_revision, overrides_json, names_json, last_checked_at, updated_at, last_error) VALUES (1, ?, '{}', NULL, 0, ?, NULL)",
+  ).bind(BUILT_IN_PRIVATE_SKIN_INDEX.revision, now).run();
+  return (await db.prepare("SELECT * FROM private_skin_catalog_state WHERE state_id = 1").first<PrivateSkinCatalogState>()) || {
+    state_id: 1,
+    current_revision: BUILT_IN_PRIVATE_SKIN_INDEX.revision,
+    overrides_json: "{}",
+    names_json: null,
+    last_checked_at: 0,
+    updated_at: now,
+    last_error: null,
+  };
+}
+
+function buildPrivateSkinIndex(state?: PrivateSkinCatalogState | null): PrivateSkinIndex {
+  const skins = new Map<number, PrivateSkinIndexItem>(
+    BUILT_IN_PRIVATE_SKIN_INDEX.skins.map((skin) => [skin.id, { ...skin }]),
+  );
+  const overrides = parseRecord<PrivateSkinOverride>(state?.overrides_json);
+  const names = parseRecord<string>(state?.names_json);
+  for (const [idValue, override] of Object.entries(overrides)) {
+    const skinId = Number(idValue);
+    if (!Number.isSafeInteger(skinId) || skinId <= 0) continue;
+    if (override.deleted) {
+      skins.delete(skinId);
+      continue;
+    }
+    const current = skins.get(skinId);
+    if (!override.path || !isSafeSkinPath(override.path)) continue;
+    skins.set(skinId, {
+      id: skinId,
+      path: override.path,
+      name: names[idValue] || current?.name || "",
+      blobSha: override.blobSha || current?.blobSha,
+    });
+  }
+  for (const [idValue, name] of Object.entries(names)) {
+    const skin = skins.get(Number(idValue));
+    if (skin && typeof name === "string" && name.trim()) skin.name = name.trim();
+  }
+  return {
+    ...BUILT_IN_PRIVATE_SKIN_INDEX,
+    revision: state?.current_revision || BUILT_IN_PRIVATE_SKIN_INDEX.revision,
+    generatedAt: state?.updated_at ? new Date(state.updated_at * 1000).toISOString() : BUILT_IN_PRIVATE_SKIN_INDEX.generatedAt,
+    skins: [...skins.values()].sort((left, right) => left.id - right.id || left.path.localeCompare(right.path)),
+  };
+}
+
+async function recordCatalogRefreshFailure(db: D1Database, state: PrivateSkinCatalogState, error: string): Promise<void> {
+  await db.prepare("UPDATE private_skin_catalog_state SET last_checked_at = ?, last_error = ? WHERE state_id = 1")
+    .bind(nowSeconds(), error.slice(0, 500)).run();
+  console.error(JSON.stringify({ event: "private_skin_catalog_refresh_failed", revision: state.current_revision, error }));
+}
+
+async function refreshPrivateSkinCatalog(env: Env, force = false): Promise<PrivateSkinCatalogState | null> {
+  if (!env.DB) return null;
+  const config = privateRepositoryConfig(env, uuid());
+  if (config instanceof Response) return null;
+  let state: PrivateSkinCatalogState;
+  try {
+    state = await ensurePrivateSkinCatalogState(env.DB);
+  } catch (error) {
+    console.error(JSON.stringify({ event: "private_skin_catalog_state_unavailable", error: error instanceof Error ? error.message : "unknown" }));
+    return null;
+  }
+  const now = nowSeconds();
+  if (!force && now - Number(state.last_checked_at || 0) < PRIVATE_SKIN_REFRESH_SECONDS) return state;
+  try {
+    const branch = await fetchGitCodeJson<{ commit?: { id?: string } }>(gitCodeBranchUrl(config), config.token);
+    const nextRevision = branch.commit?.id?.trim() || "";
+    if (!/^[0-9a-f]{40}$/i.test(nextRevision)) throw new Error("GITCODE_REVISION_INVALID");
+    if (nextRevision === state.current_revision) {
+      await env.DB.prepare("UPDATE private_skin_catalog_state SET last_checked_at = ?, last_error = NULL WHERE state_id = 1")
+        .bind(now).run();
+      return { ...state, last_checked_at: now, last_error: null };
+    }
+
+    const compared = await fetchGitCodeJson<GitCodeCompareResponse>(
+      gitCodeCompareUrl(config, state.current_revision, nextRevision),
+      config.token,
+    );
+    if (compared.truncated) throw new Error("GITCODE_COMPARE_TRUNCATED");
+    const overrides = parseRecord<PrivateSkinOverride>(state.overrides_json);
+    for (const file of compared.files || []) {
+      const currentPath = file.filename?.replace(/\\/g, "/") || "";
+      const previousPath = file.previous_filename?.replace(/\\/g, "/") || "";
+      if (previousPath && previousPath !== currentPath) {
+        const previousId = skinIdFromPath(previousPath);
+        if (previousId) overrides[String(previousId)] = { deleted: true };
+      }
+      const skinId = skinIdFromPath(currentPath);
+      if (!skinId) continue;
+      if (file.status === "removed") overrides[String(skinId)] = { deleted: true };
+      else overrides[String(skinId)] = { path: currentPath, blobSha: file.sha || undefined };
+    }
+
+    let namesJson = state.names_json;
+    const namesResponse = await fetchPrivateRepositoryFile(config, "resources/zh/skin_ids.json");
+    if (namesResponse.ok) {
+      const names = await readBoundedJson<Record<string, string>>(namesResponse, 4 * 1024 * 1024);
+      namesJson = JSON.stringify(names);
+    }
+    const overridesJson = JSON.stringify(overrides);
+    await env.DB.prepare(
+      "UPDATE private_skin_catalog_state SET current_revision = ?, overrides_json = ?, names_json = ?, last_checked_at = ?, updated_at = ?, last_error = NULL WHERE state_id = 1",
+    ).bind(nextRevision, overridesJson, namesJson, now, now).run();
+    console.log(JSON.stringify({ event: "private_skin_catalog_refreshed", from: state.current_revision, to: nextRevision, changedFiles: (compared.files || []).length }));
+    return { ...state, current_revision: nextRevision, overrides_json: overridesJson, names_json: namesJson, last_checked_at: now, updated_at: now, last_error: null };
+  } catch (error) {
+    await recordCatalogRefreshFailure(env.DB, state, error instanceof Error ? error.message : "unknown");
+    return state;
+  }
+}
+
 async function authorizeSkinRequest(request: Request, env: Env, requestIdValue: string): Promise<Response | null> {
   const dbOrError = requireDb(env, requestIdValue);
   if (dbOrError instanceof Response) return dbOrError;
@@ -509,13 +728,15 @@ async function authorizeSkinRequest(request: Request, env: Env, requestIdValue: 
   return null;
 }
 
-function loadPrivateSkinIndex(
+async function loadPrivateSkinIndex(
   env: Env,
   requestIdValue: string,
-): { index: PrivateSkinIndex; config: Exclude<ReturnType<typeof privateRepositoryConfig>, Response> } | Response {
+  refresh = false,
+): Promise<{ index: PrivateSkinIndex; config: Exclude<ReturnType<typeof privateRepositoryConfig>, Response> } | Response> {
   const config = privateRepositoryConfig(env, requestIdValue);
   if (config instanceof Response) return config;
-  const index = BUILT_IN_PRIVATE_SKIN_INDEX;
+  const state = refresh ? await refreshPrivateSkinCatalog(env) : env.DB ? await ensurePrivateSkinCatalogState(env.DB) : null;
+  const index = buildPrivateSkinIndex(state);
   if (index.schema !== 1 || index.repository !== config.label || index.ref !== config.ref
       || !Array.isArray(index.skins) || index.skins.length === 0
       || index.skins.some((skin) => !Number.isSafeInteger(skin.id) || skin.id <= 0 || !isSafeSkinPath(skin.path))) {
@@ -527,11 +748,13 @@ function loadPrivateSkinIndex(
 async function privateSkinIndex(request: Request, env: Env, requestIdValue: string): Promise<Response> {
   const authorizationError = await authorizeSkinRequest(request, env, requestIdValue);
   if (authorizationError) return authorizationError;
-  const loaded = loadPrivateSkinIndex(env, requestIdValue);
+  const loaded = await loadPrivateSkinIndex(env, requestIdValue, true);
   if (loaded instanceof Response) return loaded;
   return json(loaded.index, 200, {
     "Cache-Control": "private, max-age=300",
     "X-Cskin-Revision": loaded.index.revision,
+    "X-Cskin-Gateway": "cloudflare",
+    "X-Cskin-Upstream": "gitcode",
     "X-Content-Type-Options": "nosniff",
   });
 }
@@ -539,13 +762,18 @@ async function privateSkinIndex(request: Request, env: Env, requestIdValue: stri
 async function privateSkinFile(request: Request, env: Env, requestIdValue: string): Promise<Response> {
   const authorizationError = await authorizeSkinRequest(request, env, requestIdValue);
   if (authorizationError) return authorizationError;
-  const path = new URL(request.url).searchParams.get("path")?.trim() || "";
-  if (!isSafeSkinPath(path)) return failure("SKIN_PATH_INVALID", "皮肤资源路径无效", requestIdValue, 400);
-  const loaded = loadPrivateSkinIndex(env, requestIdValue);
+  const url = new URL(request.url);
+  const skinId = Number(url.searchParams.get("skinId") || 0);
+  const legacyPath = url.searchParams.get("path")?.trim() || "";
+  const loaded = await loadPrivateSkinIndex(env, requestIdValue);
   if (loaded instanceof Response) return loaded;
-  if (!loaded.index.skins.some((skin) => skin.path === path)) {
+  const item = Number.isSafeInteger(skinId) && skinId > 0
+    ? loaded.index.skins.find((skin) => skin.id === skinId)
+    : loaded.index.skins.find((skin) => skin.path === legacyPath);
+  if (!item) {
     return failure("SKIN_NOT_FOUND", "私有皮肤索引中没有该资源", requestIdValue, 404);
   }
+  const path = item.path;
 
   const upstream = await fetchPrivateRepositoryFile(loaded.config, path);
   if (!upstream.ok || !upstream.body) {
@@ -558,12 +786,15 @@ async function privateSkinFile(request: Request, env: Env, requestIdValue: strin
     "Content-Disposition": `attachment; filename="${fileName}"`,
     "Cache-Control": "private, no-store",
     "X-Cskin-Revision": loaded.index.revision,
+    "X-Cskin-Gateway": "cloudflare",
+    "X-Cskin-Upstream": "gitcode",
     "X-Content-Type-Options": "nosniff",
   });
   const contentLength = upstream.headers.get("content-length");
   const etag = upstream.headers.get("etag");
   if (contentLength) headers.set("Content-Length", contentLength);
   if (etag) headers.set("ETag", etag);
+  if (item.blobSha) headers.set("X-Cskin-Blob-Sha", item.blobSha);
   return new Response(upstream.body, { status: 200, headers });
 }
 
@@ -672,12 +903,14 @@ async function applySyncPayloadToD1(db: D1Database, payload: SyncPayload): Promi
   if (leaseStatements.length) await db.batch(leaseStatements);
 }
 
-function isRemoteNewer(local: LicenseRow | null, localTombstone: { changed_at: number; version: number } | null, remote: SyncPayload): boolean {
-  if (!local && !localTombstone) return true;
+function compareSyncFreshness(local: LicenseRow | null, localTombstone: { changed_at: number; version: number } | null, remote: SyncPayload): -1 | 0 | 1 {
+  if (!local && !localTombstone) return 1;
   const localTime = Number(localTombstone?.changed_at || local?.updated_at || local?.created_at || 0);
   const remoteTime = Number(remote.changedAt || remote.license?.updated_at || remote.license?.created_at || 0);
-  if (remoteTime !== localTime) return remoteTime > localTime;
-  return Number(remote.version || remote.license?.version || 0) > Number(localTombstone?.version || local?.version || 0);
+  if (remoteTime !== localTime) return remoteTime > localTime ? 1 : -1;
+  const localVersion = Number(localTombstone?.version || local?.version || 0);
+  const remoteVersion = Number(remote.version || remote.license?.version || 0);
+  return remoteVersion === localVersion ? 0 : remoteVersion > localVersion ? 1 : -1;
 }
 
 async function pushSyncPayload(env: Env, payload: SyncPayload): Promise<{ ok: boolean; remote?: SyncPayload; error?: string }> {
@@ -698,9 +931,12 @@ async function pushSyncPayload(env: Env, payload: SyncPayload): Promise<{ ok: bo
   }
 }
 
-async function processSyncOutbox(env: Env): Promise<void> {
+async function processSyncOutbox(env: Env, licenseId?: string): Promise<void> {
   if (!env.DB || !syncEndpoint(env, "internal/sync/apply")) return;
-  const rows = await env.DB.prepare("SELECT license_id, payload_json FROM sync_outbox ORDER BY updated_at LIMIT 20").all<{ license_id: string; payload_json: string }>();
+  const statement = licenseId
+    ? env.DB.prepare("SELECT license_id, payload_json FROM sync_outbox WHERE license_id = ? LIMIT 1").bind(licenseId)
+    : env.DB.prepare("SELECT license_id, payload_json FROM sync_outbox ORDER BY updated_at LIMIT 20");
+  const rows = await statement.all<{ license_id: string; payload_json: string }>();
   for (const row of rows.results) {
     let payload: SyncPayload;
     try { payload = JSON.parse(row.payload_json) as SyncPayload; } catch { await env.DB.prepare("DELETE FROM sync_outbox WHERE license_id = ?").bind(row.license_id).run(); continue; }
@@ -728,9 +964,10 @@ async function reconcileFromSupabase(env: Env): Promise<void> {
     for (const remote of body.items || []) {
       const local = await env.DB.prepare("SELECT * FROM licenses WHERE license_id = ?").bind(remote.licenseId).first<LicenseRow>();
       const tombstone = await env.DB.prepare("SELECT changed_at, version FROM sync_tombstones WHERE license_id = ?").bind(remote.licenseId).first<{ changed_at: number; version: number }>();
-      if (isRemoteNewer(local, tombstone || null, remote)) {
+      const freshness = compareSyncFreshness(local, tombstone || null, remote);
+      if (freshness > 0) {
         await applySyncPayloadToD1(env.DB, remote);
-      } else if (!remote.deleted && (local || tombstone)) {
+      } else if (freshness < 0 && (local || tombstone)) {
         if (local) await enqueueLicenseSync(env, remote.licenseId, Number(local.updated_at || local.created_at || syncNow()));
         else await enqueueDeletedLicenseSync(env, remote.licenseId, Number(tombstone?.changed_at || syncNow()), Number(tombstone?.version || 0));
       }
@@ -757,7 +994,11 @@ async function applySupabaseSync(request: Request, env: Env, requestIdValue: str
   }
   const local = await dbOrError.prepare("SELECT * FROM licenses WHERE license_id = ?").bind(payload.licenseId).first<LicenseRow>();
   const tombstone = await dbOrError.prepare("SELECT changed_at, version FROM sync_tombstones WHERE license_id = ?").bind(payload.licenseId).first<{ changed_at: number; version: number }>();
-  if (!isRemoteNewer(local, tombstone || null, payload)) {
+  const freshness = compareSyncFreshness(local, tombstone || null, payload);
+  if (freshness === 0) {
+    return json({ ok: true, action: "equal" });
+  }
+  if (freshness < 0) {
     return json({ ok: true, action: "d1_newer", current: await readSyncPayload(dbOrError, payload.licenseId) });
   }
   try {
@@ -776,6 +1017,10 @@ async function markLicenseChanged(env: Env, licenseId: string): Promise<void> {
     await env.DB.prepare("UPDATE licenses SET version = version + 1, updated_at = ? WHERE license_id = ?").bind(changedAt, licenseId).run();
   } catch { /* migration may not be applied during local development */ }
   await enqueueLicenseSync(env, licenseId, changedAt);
+  // Authorization and resource requests may fail over immediately. Push this
+  // license graph before returning so a lease created by either provider is
+  // accepted by the other provider without waiting for the five-minute cron.
+  await processSyncOutbox(env, licenseId);
 }
 
 async function createAdminSessionToken(env: Env, username: string): Promise<string | null> {
@@ -1557,10 +1802,15 @@ async function adminStats(env: Env, requestIdValue: string): Promise<Response> {
 
 async function health(env: Env, requestIdValue: string): Promise<Response> {
   let databaseReady = false;
+  let catalogRevision = BUILT_IN_PRIVATE_SKIN_INDEX.revision;
+  let catalogLastError: string | null = null;
   if (env.DB) {
     try {
       await env.DB.prepare("SELECT 1 AS ok").first();
       databaseReady = true;
+      const state = await ensurePrivateSkinCatalogState(env.DB);
+      catalogRevision = state.current_revision;
+      catalogLastError = state.last_error;
     } catch {
       databaseReady = false;
     }
@@ -1578,6 +1828,9 @@ async function health(env: Env, requestIdValue: string): Promise<Response> {
     paymentWebhookConfigured: Boolean(env.PAYMENT_WEBHOOK_SECRET),
     supabaseSyncConfigured: Boolean(env.SUPABASE_SYNC_URL && env.AUTH_SYNC_SECRET),
     privateSkinConfigured: Boolean(env.GITCODE_TOKEN && env.GITCODE_OWNER && env.GITCODE_REPOSITORY && env.GITCODE_REF && env.SKIN_REPO_LABEL),
+    catalogRevision,
+    catalogRefreshReady: databaseReady && catalogLastError === null,
+    catalogLastError,
     requestId: requestIdValue,
   }, ready ? 200 : 503);
 }
@@ -1588,6 +1841,7 @@ export default {
       await scheduledCleanup(env);
       await reconcileFromSupabase(env);
       await processSyncOutbox(env);
+      await refreshPrivateSkinCatalog(env, true);
     } catch (error) {
       console.error("scheduled license cleanup failed", error instanceof Error ? error.message : "unknown");
       controller.noRetry();

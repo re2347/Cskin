@@ -12,12 +12,13 @@ public sealed class SkinRepository
 {
     public const string PrivateRepositoryUrl = "https://gitcode.com/Re2347/skin";
     public const string RepositoryLabel = "privateskin";
-    private const string CacheMarkerSchema = "worker-private-v1";
+    private const string CacheMarkerSchema = "private-gateway-v2";
     private const string CachedIndexFileName = "skin_worker_index.json";
-    private static readonly Uri[] WorkerBaseUrls =
+    private static readonly ResourceEndpoint[] ResourceEndpoints =
     [
-        new("https://license.re2347.ccwu.cc/"),
-        new("https://cskin-license-staging.2469416170.workers.dev/"),
+        new("supabase", new Uri("https://kzqgphxrghdclkwneqyn.supabase.co/functions/v1/auth/")),
+        new("cloudflare", new Uri("https://license.re2347.ccwu.cc/")),
+        new("cloudflare", new Uri("https://cskin-license-staging.2469416170.workers.dev/")),
     ];
     private static readonly HttpClient RepositoryHttp = CreateHttpClient();
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
@@ -29,6 +30,7 @@ public sealed class SkinRepository
     private readonly SemaphoreSlim _indexPrimeGate = new(1, 1);
     private ConcurrentDictionary<int, string> _paths = [];
     private ConcurrentDictionary<int, string> _names = [];
+    private ConcurrentDictionary<int, string> _blobShas = [];
     private ConcurrentDictionary<int, string> _previewPaths = [];
     private string? _portableRoot;
     private string _revision = "";
@@ -37,7 +39,7 @@ public sealed class SkinRepository
 
     public SkinRepository(string? portableRoot) => _portableRoot = portableRoot;
 
-    public string RepositoryPath => $"{RepositoryLabel} via Worker";
+    public string RepositoryPath => $"{RepositoryLabel} via Supabase/Cloudflare";
     public string RepositoryUrl => PrivateRepositoryUrl;
     public int RemoteSkinCount => _paths.Count;
     public bool IsReady => _paths.Count > 0;
@@ -125,8 +127,9 @@ public sealed class SkinRepository
             LastSyncChanged = false;
             await PrimeLocalIndexAsync(progress, cancellationToken);
             progress?.Report("正在通过安全资源服务检查皮肤索引");
-            AppLog.Info($"开始同步私有皮肤索引：source={RepositoryLabel} transport=Worker gitClient=False");
-            var remote = await DownloadIndexAsync(cancellationToken);
+            AppLog.Info($"开始同步私有皮肤索引：source={RepositoryLabel} transport=Supabase/Cloudflare gitClient=False");
+            var downloadedIndex = await DownloadIndexAsync(cancellationToken);
+            var remote = downloadedIndex?.Index;
             if (remote is null || remote.Skins.Count == 0)
             {
                 AppLog.Warn($"私有皮肤索引同步失败，继续使用本地索引：skins={_paths.Count}");
@@ -135,11 +138,13 @@ public sealed class SkinRepository
 
             var paths = new Dictionary<int, string>();
             var names = new Dictionary<int, string>();
+            var blobShas = new Dictionary<int, string>();
             foreach (var skin in remote.Skins)
             {
                 if (skin.Id <= 0 || !TryNormalizeSkinPath(skin.Path, skin.Id, out var normalized)) continue;
                 paths.TryAdd(skin.Id, normalized);
                 if (!string.IsNullOrWhiteSpace(skin.Name)) names[skin.Id] = skin.Name.Trim();
+                if (IsGitObjectId(skin.BlobSha)) blobShas[skin.Id] = skin.BlobSha.Trim();
             }
             if (paths.Count == 0)
             {
@@ -150,12 +155,13 @@ public sealed class SkinRepository
             var previousRevision = _revision;
             _paths = new ConcurrentDictionary<int, string>(paths);
             _names = new ConcurrentDictionary<int, string>(MergeNames(names));
+            _blobShas = new ConcurrentDictionary<int, string>(blobShas);
             _previewPaths = [];
             _revision = remote.Revision ?? "";
             LastSyncChanged = !string.Equals(previousRevision, _revision, StringComparison.OrdinalIgnoreCase);
             await SaveCachedIndexAsync(remote, cancellationToken);
             progress?.Report($"私有资源索引已就绪 · {_paths.Count:N0} 个皮肤");
-            AppLog.Info($"私有皮肤索引同步完成：source={RepositoryLabel} skins={_paths.Count} revision={ShortRevision(_revision)}");
+            AppLog.Info($"私有皮肤索引同步完成：source={RepositoryLabel} gateway={downloadedIndex!.Gateway} upstream={downloadedIndex.Upstream} endpoint={downloadedIndex.Endpoint} skins={_paths.Count} revision={ShortRevision(_revision)}");
             return true;
         }
         finally
@@ -176,20 +182,20 @@ public sealed class SkinRepository
             {
                 LoadIndex(cached);
                 progress?.Report($"上次私有资源索引已就绪 · {_paths.Count:N0} 个皮肤");
-                AppLog.Info($"已加载上次 Worker 索引：skins={_paths.Count} revision={ShortRevision(_revision)}");
+                AppLog.Info($"已加载上次私有资源索引：skins={_paths.Count} revision={ShortRevision(_revision)}");
                 return true;
             }
 
             var paths = await LoadBundledPathIndexAsync(cancellationToken);
             if (paths.Count == 0)
             {
-                AppLog.Warn("随包皮肤路径索引为空，等待 Worker 索引");
+                AppLog.Warn("随包皮肤路径索引为空，等待安全资源服务索引");
                 return false;
             }
             _paths = new ConcurrentDictionary<int, string>(paths);
             _names = new ConcurrentDictionary<int, string>(await LoadNamesFromFilesAsync(cancellationToken));
             progress?.Report($"随包资源索引已就绪 · {_paths.Count:N0} 个皮肤");
-            AppLog.Info($"随包皮肤路径索引已就绪：skins={_paths.Count}；远程更新通过 Worker 获取");
+            AppLog.Info($"随包皮肤路径索引已就绪：skins={_paths.Count}；远程更新通过 Supabase/Cloudflare 获取");
             return true;
         }
         finally
@@ -210,7 +216,7 @@ public sealed class SkinRepository
     {
         if (_portableRoot is null || !TryGetRemotePath(skinId, out var relativePath)) return null;
         if (!TryResolveTarget(_portableRoot, relativePath, skinId, out var target)) return null;
-        return HasTrustedCache(target) ? target : null;
+        return HasTrustedCache(target, _revision, _blobShas.GetValueOrDefault(skinId)) ? target : null;
     }
 
     public async Task<string?> EnsureSkinCachedAsync(int skinId, CancellationToken cancellationToken = default)
@@ -230,13 +236,14 @@ public sealed class SkinRepository
             AppLog.Error($"私有资源索引路径被拒绝：skinId={skinId} path={relativePath}");
             return null;
         }
-        AppLog.Info($"准备下载皮肤：skinId={skinId} source={RepositoryLabel} transport=Worker engineRoot={_portableRoot} target={target} relativePath={relativePath}");
-        if (HasTrustedCache(target)) return target;
+        var expectedBlobSha = _blobShas.GetValueOrDefault(skinId);
+        AppLog.Info($"准备下载皮肤：skinId={skinId} source={RepositoryLabel} transport=Supabase/Cloudflare revision={ShortRevision(_revision)} blob={ShortRevision(expectedBlobSha)} engineRoot={_portableRoot} target={target} relativePath={relativePath}");
+        if (HasTrustedCache(target, _revision, expectedBlobSha)) return target;
 
         await _downloadGate.WaitAsync(cancellationToken);
         try
         {
-            if (HasTrustedCache(target)) return target;
+            if (HasTrustedCache(target, _revision, expectedBlobSha)) return target;
             Directory.CreateDirectory(Path.GetDirectoryName(target)!);
             var temp = target + ".partial";
             try { File.Delete(temp); } catch { }
@@ -244,7 +251,12 @@ public sealed class SkinRepository
             if (downloaded is null || !File.Exists(temp) || new FileInfo(temp).Length <= 0)
             {
                 try { File.Delete(temp); } catch { }
-                AppLog.Error($"Worker 未能下载皮肤：skinId={skinId} path={relativePath}");
+                if (HasValidatedCache(target))
+                {
+                    AppLog.Warn($"远程资源通道均不可用，使用已通过哈希校验的本地缓存：skinId={skinId} cachedRevision={ShortRevision(ReadCacheRevision(target))} expectedRevision={ShortRevision(_revision)}");
+                    return target;
+                }
+                AppLog.Error($"安全资源服务未能下载皮肤且没有有效本地缓存：skinId={skinId} path={relativePath}");
                 return null;
             }
             if (!ValidateFantomeArchive(temp, out var validationDetail))
@@ -265,12 +277,15 @@ public sealed class SkinRepository
                 source = downloaded.Source,
                 repository = RepositoryLabel,
                 revision = downloaded.Revision,
+                blobSha = downloaded.BlobSha,
                 etag = downloaded.ETag,
+                gateway = downloaded.Gateway,
+                upstream = downloaded.Upstream,
                 bytes = targetBytes,
                 sha256 = packageSha256,
             });
             await File.WriteAllTextAsync(CacheMarkerPath(target), marker, new UTF8Encoding(false), cancellationToken);
-            AppLog.Info($"皮肤下载完成：skinId={skinId} target={target} bytes={targetBytes} source={downloaded.Source} revision={ShortRevision(downloaded.Revision)}");
+            AppLog.Info($"皮肤下载完成：skinId={skinId} target={target} bytes={targetBytes} source={downloaded.Source} gateway={downloaded.Gateway} upstream={downloaded.Upstream} revision={ShortRevision(downloaded.Revision)} blob={ShortRevision(downloaded.BlobSha)} elapsedMs={downloaded.ElapsedMilliseconds}");
             return target;
         }
         finally
@@ -286,16 +301,17 @@ public sealed class SkinRepository
         return client;
     }
 
-    private async Task<WorkerIndex?> DownloadIndexAsync(CancellationToken cancellationToken)
+    private async Task<DownloadedIndex?> DownloadIndexAsync(CancellationToken cancellationToken)
     {
-        foreach (var endpoint in WorkerBaseUrls)
+        foreach (var endpoint in ResourceEndpoints)
         {
             if (_stopping) return null;
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
             timeout.CancelAfter(TimeSpan.FromSeconds(45));
+            var started = Environment.TickCount64;
             try
             {
-                using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(endpoint, "v1/skins/index"));
+                using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(endpoint.BaseUrl, "v1/skins/index"));
                 if (!AddLeaseHeaders(request))
                 {
                     AppLog.Warn("私有资源请求缺少有效授权租约，请重新验证密钥");
@@ -304,22 +320,34 @@ public sealed class SkinRepository
                 using var response = await RepositoryHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
                 if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
                 {
-                    AppLog.Warn($"私有皮肤索引授权被拒绝：endpoint={endpoint.Host} status={(int)response.StatusCode}");
+                    AppLog.Warn($"私有皮肤索引授权被拒绝，不再切换副本：endpoint={endpoint.BaseUrl.Host} status={(int)response.StatusCode}");
                     return null;
                 }
                 if (!response.IsSuccessStatusCode)
                 {
-                    AppLog.Warn($"私有皮肤索引请求失败：endpoint={endpoint.Host} status={(int)response.StatusCode}");
-                    continue;
+                    var transient = IsTransientStatus(response.StatusCode);
+                    AppLog.Warn($"私有皮肤索引请求失败：endpoint={endpoint.BaseUrl.Host} status={(int)response.StatusCode} transient={transient}");
+                    if (transient) continue;
+                    return null;
                 }
                 await using var stream = await response.Content.ReadAsStreamAsync(timeout.Token);
                 var value = await JsonSerializer.DeserializeAsync<WorkerIndex>(stream, JsonOptions, timeout.Token);
-                if (value is not null) return value;
+                var gateway = Header(response, "X-Cskin-Gateway");
+                var upstream = Header(response, "X-Cskin-Upstream");
+                var revision = Header(response, "X-Cskin-Revision");
+                if (!IsValidRemoteIndex(value, endpoint, gateway, upstream, revision, out var detail))
+                {
+                    AppLog.Warn($"私有皮肤索引副本校验失败，切换下一通道：endpoint={endpoint.BaseUrl.Host} detail={detail}");
+                    continue;
+                }
+                var elapsed = Environment.TickCount64 - started;
+                AppLog.Info($"私有皮肤索引响应有效：endpoint={endpoint.BaseUrl.Host} gateway={gateway} upstream={upstream} skins={value!.Skins.Count} revision={ShortRevision(value.Revision)} elapsedMs={elapsed}");
+                return new DownloadedIndex(value, gateway, upstream, endpoint.BaseUrl.Host);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or JsonException or IOException)
             {
-                AppLog.Warn($"私有皮肤索引请求异常：endpoint={endpoint.Host} error={ex.Message}");
+                AppLog.Warn($"私有皮肤索引临时异常，切换下一通道：endpoint={endpoint.BaseUrl.Host} elapsedMs={Environment.TickCount64 - started} error={ex.Message}");
             }
         }
         return null;
@@ -327,44 +355,77 @@ public sealed class SkinRepository
 
     private async Task<DownloadedPackage?> DownloadSkinAsync(int skinId, string relativePath, string outputPath, CancellationToken cancellationToken)
     {
-        foreach (var endpoint in WorkerBaseUrls)
+        foreach (var endpoint in ResourceEndpoints)
         {
             if (_stopping) return null;
             using var timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeout.CancelAfter(TimeSpan.FromMinutes(5));
+            timeout.CancelAfter(TimeSpan.FromMinutes(3));
+            var started = Environment.TickCount64;
+            try { File.Delete(outputPath); } catch { }
             try
             {
                 using var request = new HttpRequestMessage(HttpMethod.Get,
-                    new Uri(endpoint, "v1/skins/file?path=" + Uri.EscapeDataString(relativePath)));
+                    new Uri(endpoint.BaseUrl, "v1/skins/file?skinId=" + skinId));
                 if (!AddLeaseHeaders(request)) return null;
                 using var response = await RepositoryHttp.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, timeout.Token);
                 if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
                 {
-                    AppLog.Warn($"私有皮肤下载授权被拒绝：skinId={skinId} endpoint={endpoint.Host} status={(int)response.StatusCode}");
+                    AppLog.Warn($"私有皮肤下载授权被拒绝，不再切换副本：skinId={skinId} endpoint={endpoint.BaseUrl.Host} status={(int)response.StatusCode}");
                     return null;
                 }
                 if (!response.IsSuccessStatusCode)
                 {
-                    AppLog.Warn($"私有皮肤下载未命中：skinId={skinId} endpoint={endpoint.Host} status={(int)response.StatusCode} path={relativePath}");
-                    continue;
+                    var transient = IsTransientStatus(response.StatusCode);
+                    AppLog.Warn($"私有皮肤下载请求失败：skinId={skinId} endpoint={endpoint.BaseUrl.Host} status={(int)response.StatusCode} transient={transient} path={relativePath}");
+                    if (transient) continue;
+                    return null;
                 }
 
-                await using var source = await response.Content.ReadAsStreamAsync(timeout.Token);
-                await using var destination = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, useAsync: true);
-                await source.CopyToAsync(destination, timeout.Token);
-                await destination.FlushAsync(timeout.Token);
-                var bytes = destination.Length;
-                if (bytes < 2) continue;
+                var gateway = Header(response, "X-Cskin-Gateway");
+                var upstream = Header(response, "X-Cskin-Upstream");
                 var revision = Header(response, "X-Cskin-Revision");
+                var blobSha = Header(response, "X-Cskin-Blob-Sha");
+                var expectedBlobSha = _blobShas.GetValueOrDefault(skinId);
+                if (!string.Equals(gateway, endpoint.Gateway, StringComparison.OrdinalIgnoreCase)
+                    || !string.Equals(upstream, "gitcode", StringComparison.OrdinalIgnoreCase)
+                    || string.IsNullOrWhiteSpace(revision)
+                    || (!string.IsNullOrWhiteSpace(_revision) && !string.Equals(revision, _revision, StringComparison.OrdinalIgnoreCase))
+                    || (IsGitObjectId(expectedBlobSha) && !string.Equals(blobSha, expectedBlobSha, StringComparison.OrdinalIgnoreCase)))
+                {
+                    AppLog.Warn($"私有皮肤资源副本校验失败，切换下一通道：skinId={skinId} endpoint={endpoint.BaseUrl.Host} gateway={gateway} upstream={upstream} revision={ShortRevision(revision)} expectedRevision={ShortRevision(_revision)} blob={ShortRevision(blobSha)} expectedBlob={ShortRevision(expectedBlobSha)}");
+                    continue;
+                }
+                await using var source = await response.Content.ReadAsStreamAsync(timeout.Token);
+                long bytes;
+                await using (var destination = new FileStream(outputPath, FileMode.Create, FileAccess.Write, FileShare.None, 128 * 1024, useAsync: true))
+                {
+                    await source.CopyToAsync(destination, timeout.Token);
+                    await destination.FlushAsync(timeout.Token);
+                    bytes = destination.Length;
+                }
+                var validationDetail = bytes < 2 ? "empty response body" : "";
+                if (bytes < 2 || !ValidateFantomeArchive(outputPath, out validationDetail))
+                {
+                    try { File.Delete(outputPath); } catch { }
+                    AppLog.Warn($"私有皮肤资源内容无效，切换下一通道：skinId={skinId} endpoint={endpoint.BaseUrl.Host} bytes={bytes} detail={validationDetail}");
+                    continue;
+                }
                 var etag = response.Headers.ETag?.Tag ?? Header(response, "ETag");
-                AppLog.Info($"Worker 皮肤下载完成：skinId={skinId} endpoint={endpoint.Host} bytes={bytes} revision={ShortRevision(revision)} path={relativePath}");
-                return new DownloadedPackage("worker-privateskin", revision, etag, bytes);
+                var elapsed = Environment.TickCount64 - started;
+                AppLog.Info($"私有皮肤流式下载完成：skinId={skinId} endpoint={endpoint.BaseUrl.Host} gateway={gateway} upstream={upstream} bytes={bytes} revision={ShortRevision(revision)} blob={ShortRevision(blobSha)} elapsedMs={elapsed} path={relativePath}");
+                return new DownloadedPackage("private-gitcode", gateway, upstream, revision, blobSha, etag, bytes, elapsed);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException or UnauthorizedAccessException)
+            catch (UnauthorizedAccessException ex)
             {
                 try { File.Delete(outputPath); } catch { }
-                AppLog.Warn($"私有皮肤下载异常：skinId={skinId} endpoint={endpoint.Host} path={relativePath} error={ex.Message}");
+                AppLog.Error($"皮肤缓存目录无写入权限：skinId={skinId} path={outputPath}", ex);
+                return null;
+            }
+            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException)
+            {
+                try { File.Delete(outputPath); } catch { }
+                AppLog.Warn($"私有皮肤下载临时异常，切换下一通道：skinId={skinId} endpoint={endpoint.BaseUrl.Host} elapsedMs={Environment.TickCount64 - started} path={relativePath} error={ex.Message}");
             }
         }
         return null;
@@ -389,14 +450,17 @@ public sealed class SkinRepository
     {
         var paths = new Dictionary<int, string>();
         var names = new Dictionary<int, string>();
+        var blobShas = new Dictionary<int, string>();
         foreach (var skin in index.Skins)
         {
             if (skin.Id <= 0 || !TryNormalizeSkinPath(skin.Path, skin.Id, out var path)) continue;
             paths.TryAdd(skin.Id, path);
             if (!string.IsNullOrWhiteSpace(skin.Name)) names[skin.Id] = skin.Name.Trim();
+            if (IsGitObjectId(skin.BlobSha)) blobShas[skin.Id] = skin.BlobSha.Trim();
         }
         _paths = new ConcurrentDictionary<int, string>(paths);
         _names = new ConcurrentDictionary<int, string>(MergeNames(names));
+        _blobShas = new ConcurrentDictionary<int, string>(blobShas);
         _revision = index.Revision ?? "";
     }
 
@@ -436,6 +500,43 @@ public sealed class SkinRepository
     private static string Header(HttpResponseMessage response, string name) =>
         response.Headers.TryGetValues(name, out var values) ? values.FirstOrDefault() ?? "" : "";
 
+    private static bool IsTransientStatus(HttpStatusCode status) =>
+        status is HttpStatusCode.RequestTimeout or HttpStatusCode.TooManyRequests || (int)status >= 500;
+
+    private static bool IsGitObjectId(string? value) =>
+        !string.IsNullOrWhiteSpace(value) && value.Length == 40 && value.All(Uri.IsHexDigit);
+
+    private static bool IsValidRemoteIndex(
+        WorkerIndex? index,
+        ResourceEndpoint endpoint,
+        string gateway,
+        string upstream,
+        string headerRevision,
+        out string detail)
+    {
+        if (!string.Equals(gateway, endpoint.Gateway, StringComparison.OrdinalIgnoreCase))
+        {
+            detail = $"gateway mismatch: actual={gateway} expected={endpoint.Gateway}";
+            return false;
+        }
+        if (!string.Equals(upstream, "gitcode", StringComparison.OrdinalIgnoreCase))
+        {
+            detail = $"upstream mismatch: actual={upstream} expected=gitcode";
+            return false;
+        }
+        if (index is null || index.Schema != 1 || !string.Equals(index.Repository, RepositoryLabel, StringComparison.Ordinal)
+            || !string.Equals(index.Ref, "main", StringComparison.Ordinal) || index.Skins.Count == 0
+            || string.IsNullOrWhiteSpace(index.Revision)
+            || !string.Equals(index.Revision, headerRevision, StringComparison.OrdinalIgnoreCase)
+            || index.Skins.Any(skin => skin.Id <= 0 || !TryNormalizeSkinPath(skin.Path, skin.Id, out _)))
+        {
+            detail = "schema, repository, revision, or skin path is invalid";
+            return false;
+        }
+        detail = "ok";
+        return true;
+    }
+
     private static string ShortRevision(string? revision) =>
         string.IsNullOrWhiteSpace(revision) ? "<none>" : revision[..Math.Min(12, revision.Length)];
 
@@ -468,8 +569,24 @@ public sealed class SkinRepository
 
     private static string CacheMarkerPath(string target) => target + ".source.json";
 
-    private static bool HasTrustedCache(string target)
+    private static bool HasTrustedCache(string target, string? expectedRevision, string? expectedBlobSha)
     {
+        if (!TryReadValidatedCacheMarker(target, out var marker)) return false;
+        if (!string.IsNullOrWhiteSpace(expectedRevision)
+            && !string.Equals(marker.Revision, expectedRevision, StringComparison.OrdinalIgnoreCase)) return false;
+        if (IsGitObjectId(expectedBlobSha)
+            && !string.Equals(marker.BlobSha, expectedBlobSha, StringComparison.OrdinalIgnoreCase)) return false;
+        return true;
+    }
+
+    private static bool HasValidatedCache(string target) => TryReadValidatedCacheMarker(target, out _);
+
+    private static string ReadCacheRevision(string target) =>
+        TryReadValidatedCacheMarker(target, out var marker) ? marker.Revision : "";
+
+    private static bool TryReadValidatedCacheMarker(string target, out CacheMarker marker)
+    {
+        marker = new CacheMarker();
         try
         {
             var file = new FileInfo(target);
@@ -485,6 +602,11 @@ public sealed class SkinRepository
                 || expectedBytes != file.Length
                 || !root.TryGetProperty("sha256", out var sha256)
                 || string.IsNullOrWhiteSpace(sha256.GetString())) return false;
+            marker = new CacheMarker
+            {
+                Revision = root.TryGetProperty("revision", out var revision) ? revision.GetString() ?? "" : "",
+                BlobSha = root.TryGetProperty("blobSha", out var blobSha) ? blobSha.GetString() ?? "" : "",
+            };
             using var stream = file.OpenRead();
             return string.Equals(Convert.ToHexString(SHA256.HashData(stream)), sha256.GetString(), StringComparison.OrdinalIgnoreCase);
         }
@@ -580,7 +702,25 @@ public sealed class SkinRepository
         }
     }
 
-    private sealed record DownloadedPackage(string Source, string Revision, string ETag, long Bytes);
+    private sealed record ResourceEndpoint(string Gateway, Uri BaseUrl);
+
+    private sealed record DownloadedIndex(WorkerIndex Index, string Gateway, string Upstream, string Endpoint);
+
+    private sealed record DownloadedPackage(
+        string Source,
+        string Gateway,
+        string Upstream,
+        string Revision,
+        string BlobSha,
+        string ETag,
+        long Bytes,
+        long ElapsedMilliseconds);
+
+    private sealed class CacheMarker
+    {
+        public string Revision { get; init; } = "";
+        public string BlobSha { get; init; } = "";
+    }
 
     private sealed class WorkerIndex
     {
@@ -596,5 +736,6 @@ public sealed class SkinRepository
         public int Id { get; set; }
         public string Path { get; set; } = "";
         public string Name { get; set; } = "";
+        public string BlobSha { get; set; } = "";
     }
 }
