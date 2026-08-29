@@ -1,5 +1,5 @@
 #define AppName "PortableCskin"
-#define AppVersion "0.2.14"
+#define AppVersion "0.2.16"
 #define AppPublisher "Cskin"
 #define AppExeName "PortableCskin.exe"
 #define PublishDir "..\publish-final"

@@ -896,3 +896,75 @@ distributed. A signed installer should be generated with the existing
 本轮停止该目录下的 Cskin 宿主和引擎进程，将 `publish-final` 的 `0.2.14.0` 宿主、
 冻结引擎及资源同步回原目录。同步过程没有删除 `Engine\\data`、`Engine\\skins`、日志或
 其他用户数据；重新启动该目录的 `PortableCskin.exe` 后，佛耶戈皮肤会进入正常应用流程。
+
+## 2026-08-30 0.2.15 盖伦堕落神王 86044 槽位映射修复
+
+用户反馈“堕落神王 盖伦（86044）”无法应用。对远程包和当前客户端 WAD 做了实际核对：
+
+- GitCode `skins/86/86044/86044.fantome` 可正常读取，包大小为 `9,684,313` bytes，
+  包内只有 `WAD/Garen.wad.client`，并同时包含 Skin0、Skin44 以及 Skin13 的共享资源；
+  因此问题不是远程下载缺失。
+- 86044 导入后的 WAD 同时存在盖伦基础槽（Skin0）和源槽（Skin44）。旧映射逻辑在客户端
+  当前选择 Skin13 等非 0 槽位时，会把两个 PROP 条目都重写成同一目标哈希，导致重复 WAD
+  路径。`mod-tools` 可能丢弃重复条目，客户端最终表现为皮肤未生效或加载失败。
+- 引擎现在会记录映射过程中已经写入的目标哈希。第一个条目占用目标槽，后续条目保留原始
+  哈希，从而保证每个 WAD 路径唯一；目标槽已经存在时仍保持原有条目，不破坏复杂皮肤包的
+  Skin0/Skin44 组合。
+
+验证：
+
+- 86044 导入 WAD 在目标槽 0、13、44 下均能完成映射；三种结果均为 297 个条目、297 个
+  唯一哈希，WAD 校验通过。目标 13 的结果只将一个条目映射到 Skin13，不再生成重复哈希。
+- 对映射后的目标 13 WAD 执行 `mod-tools mkoverlay`，生成有效的
+  `DATA/FINAL/Champions/Garen.wad.client`，命令退出码为 0。
+- `python -m py_compile v2/Runtime/Cskin/cskin_engine.py` 通过。冻结引擎需要重新构建后，
+  便携目录中的 `Cskin.exe` 才会包含本修复；本轮不生成安装包或压缩包。
+
+## 2026-08-30 0.2.15.1 实际运行目录同步
+
+用户提供的失败日志来自 `v2\\PortableCskin-20260829-133157`，不是刚才回归使用的
+`v2\\PortableCskin`。该目录当时仍使用旧的 `Cskin.exe`、`cskin_engine.pyc` 和
+`mod-tools.exe`，所以在 `Creating tmp directory` / `Unzipping mod` 后直接退出。
+
+本轮已在不删除该目录 `Engine\\data`、`Engine\\skins` 和日志的前提下，同步：
+
+- `Engine\\Cskin.exe` SHA-256 `E3D4EC2F32ED863ED645DEA6EDC6EC219837D315AB8784F38666EBF00BD44093`；
+- `Engine\\cskin_engine.pyc` SHA-256 `F8D71E80087CB84AD7280C08909B5A0188D3BC17F3D9745F5B142DD0D0002854`；
+- `Engine\\tools\\mod-tools.exe` SHA-256 `36F74F7D2110567A062FB4581A72E0AE98266E7DAD151E40FFBF224DBF3F0B24`。
+
+同步后的同目录引擎隔离应用 86044 已验证：目标槽 0 返回 `ok=true`、
+`injectionStatus=waiting-game`，约 4.8 秒完成 Fantome 导入并生成 1 个 Garen 覆盖 WAD；
+后台监控正常启动。此前 `Unzipping mod` 失败日志属于旧工具文件，不能代表同步后的结果。
+
+## 2026-08-30 0.2.16 深路径导入修复与版本指纹
+
+用户最新日志仍在 `mod-tools import` 的 `Creating tmp directory` / `Unzipping mod`
+阶段失败。使用同一 `86044.fantome` 在当前目录复现后确认：短路径 `%TEMP%` 导入成功，
+而在 `PortableCskin-20260829-133157\\Engine\\data\\injection\\mods\\skin_86044` 导入时，
+`mod-tools` 为展开包中的深层资源创建文件失败并返回“系统找不到指定的路径”。这属于
+工具的旧 Windows 路径长度限制，不是 LCU、远程仓库或皮肤包缺失。
+
+修复内容：
+
+- 展开式 Fantome 先导入 `%TEMP%\\CskinImport\\<skinId>-<随机目录>\\mod`，完成后再复制
+  到当前软件的 `Engine\\data\\injection\\mods\\skin_<skinId>`；跨盘安装也使用复制，避免
+  对安装目录长度作假设。临时目录在成功或失败后自动清理。
+- 每次调用 `mod-tools` 记录实际路径、工作目录、文件大小、SHA-256 和参数长度；引擎启动
+  记录 `Engine build: 0.2.16-path-staging`，可从日志确认桌面宿主启动的是新引擎。
+
+因此这次需要同时更新桌面宿主和 `Engine\\Cskin.exe`。只替换源码或只复制旧便携目录
+不会包含修复；重建后的日志应先出现 `Engine build: 0.2.16-path-staging`，然后出现
+`Expanded package import staging` 与 `Expanded package imported`，不再停在 `Unzipping mod`。
+
+另外修正了仓库内 `installer/test-frozen-fast-apply.ps1` 的 PowerShell 路径字面量，
+使冻结回归脚本可以实际执行，而不是在测试启动前因 `"D:\\"` 语法错误退出。
+
+构建与验收结果：
+
+- `dotnet publish` 和 PyInstaller 引擎构建均完成；桌面宿主文件版本为 `0.2.16.0`。
+- 新便携目录 `PortableCskin` 的 86044 冻结回归返回 `ok=true`、
+  `injectionStatus=waiting-game`、`overlayWadCount=1`，应用请求耗时约 4.758 秒。
+- 用户实际目录 `PortableCskin-20260829-133157` 已同步 0.2.16 宿主和引擎文件，
+  仅更新程序文件；原有 `Engine\\data`、`Engine\\skins`、`skin-repo` 和日志均保留。
+- 便携压缩包 `PortableCskin.zip` 大小为 `90,452,429` bytes，SHA-256 为
+  `6160A1E4027919447C34C18B771BE2FD4E633978AA492C55EA3AAE834FE25623`。

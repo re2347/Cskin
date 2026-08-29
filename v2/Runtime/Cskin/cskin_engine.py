@@ -14,6 +14,7 @@ import ssl
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import zipfile
@@ -41,6 +42,7 @@ LOG_PATH = DATA / "selector.log"
 MOD_TOOLS_TIMEOUT_SECONDS = 180
 OVERLAY_DIAGNOSTIC_SECONDS = 300
 OVERLAY_DIAGNOSTIC_INTERVAL_SECONDS = 2
+ENGINE_BUILD = "0.2.16-path-staging"
 
 
 def log(message: str) -> None:
@@ -654,6 +656,14 @@ class OverlayApplier:
             return None
 
         rebuilt = bytearray(wad)
+        # Track hashes introduced during this pass as well as hashes that were
+        # already present.  Complex packages such as Garen 86044 contain both
+        # a base-slot PROP (skin0) and a source-slot PROP (skin44).  When the
+        # selected target is a third slot (for example skin13), treating the
+        # original TOC as immutable rewrites both records to the same target
+        # hash and creates a duplicate WAD entry.  The first mapped record owns
+        # the target; later records remain at their original hash.
+        mapped_hashes = set(wad_hashes)
         recognized = False
         for index in range(count):
             offset = cls._TOC_OFFSET + index * cls._TOC_ENTRY_SIZE
@@ -703,7 +713,7 @@ class OverlayApplier:
                 # crashes while loading the redirected archive. In that case
                 # the package already supports the target slot, so preserve
                 # both original entries exactly as the legacy engine did.
-                if target_hash in wad_hashes:
+                if target_hash in mapped_hashes:
                     log(
                         f"Slot mapping preserved existing target entry: wad={champion_hint} "
                         f"sourceIndex={source_index} targetIndex={target_index} "
@@ -711,6 +721,7 @@ class OverlayApplier:
                     )
                     continue
                 struct.pack_into("<Q", rebuilt, offset, target_hash)
+                mapped_hashes.add(target_hash)
 
         if not recognized:
             return None
@@ -798,6 +809,17 @@ class OverlayApplier:
         # cannot accidentally resolve a DLL from another installation.
         tool_path = str(self.tools_dir)
         environment["PATH"] = tool_path + os.pathsep + environment.get("PATH", "")
+        try:
+            tool_exists = self.mod_tools.is_file()
+            tool_bytes = self.mod_tools.stat().st_size if tool_exists else 0
+            tool_sha256 = hashlib.sha256(self.mod_tools.read_bytes()).hexdigest() if tool_exists else "<missing>"
+        except OSError as error:
+            tool_exists = False
+            tool_bytes = 0
+            tool_sha256 = f"<error:{error}>"
+        log(f"mod-tools invocation: path={self.mod_tools} exists={tool_exists} "
+            f"bytes={tool_bytes} sha256={tool_sha256} cwd={self.tools_dir} "
+            f"argLengths={[len(str(value)) for value in arguments]}")
         if background:
             dll = self.tools_dir / "cslol-dll.dll"
             log(f"Running mod-tools background: {' '.join(arguments)} cwd={self.tools_dir} "
@@ -1090,12 +1112,33 @@ class OverlayApplier:
             mod_name = f"skin_{skin_id}"
             mod_dir = self.mods_dir / mod_name
             if package_layout == "expanded":
-                mod_dir.mkdir(parents=True, exist_ok=True)
-                import_result = self._run(["import", str(cached), str(mod_dir),
-                                           f"--game:{game_dir}", "--noTFT"])
-                import_output = (import_result.stdout or "").strip()
-                log(f"Expanded package imported: skinId={skin_id} mod={mod_dir} "
-                    f"output={import_output[-1000:] if import_output else '<empty>'}")
+                # mod-tools has a legacy MAX_PATH limitation while creating
+                # deeply nested files from expanded Fantome packages. A
+                # portable app can itself live under a long path, so import
+                # into a short system-temp directory first, then copy the
+                # completed mod tree beside the engine.
+                import_stage: Path | None = None
+                try:
+                    temp_root = Path(tempfile.gettempdir()) / "CskinImport"
+                    temp_root.mkdir(parents=True, exist_ok=True)
+                    import_stage = Path(tempfile.mkdtemp(prefix=f"{skin_id}-", dir=str(temp_root)))
+                    staged_mod_dir = import_stage / "mod"
+                    log(f"Expanded package import staging: skinId={skin_id} "
+                        f"archive={cached} archiveLength={len(str(cached))} "
+                        f"stagedMod={staged_mod_dir} stagedLength={len(str(staged_mod_dir))} "
+                        f"finalMod={mod_dir} finalLength={len(str(mod_dir))}")
+                    import_result = self._run(["import", str(cached), str(staged_mod_dir),
+                                               f"--game:{game_dir}", "--noTFT"])
+                    if not staged_mod_dir.is_dir():
+                        raise ApplyError(f"mod-tools import completed without output: {staged_mod_dir}")
+                    self._clear(mod_dir)
+                    shutil.copytree(staged_mod_dir, mod_dir, dirs_exist_ok=True)
+                    import_output = (import_result.stdout or "").strip()
+                    log(f"Expanded package imported: skinId={skin_id} stagedMod={staged_mod_dir} "
+                        f"finalMod={mod_dir} output={import_output[-1000:] if import_output else '<empty>'}")
+                finally:
+                    if import_stage is not None:
+                        shutil.rmtree(import_stage, ignore_errors=True)
                 if same_champion_target:
                     mapped = self._alias_mod_for_sources(mod_dir, source_indices, target_index)
                     if not mapped and target_index != 0:
@@ -1450,6 +1493,7 @@ def main() -> None:
         Handler.catalog.lock = threading.RLock()
     Handler.applier = OverlayApplier()
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    log(f"Engine build: {ENGINE_BUILD} root={ROOT} frozen={FROZEN}")
     log(f"Selector ready at http://127.0.0.1:{server.server_port}/")
     try:
         server.serve_forever()
