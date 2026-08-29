@@ -1,5 +1,9 @@
 ﻿[CmdletBinding()]
 param(
+    # Official distributable build without Authenticode. Windows will show
+    # an Unknown publisher warning; this mode must be explicitly requested.
+    [switch]$UnsignedReleaseBuild,
+
     # Local functional tests may be unsigned. Do not use this switch for a
     # package distributed to users.
     [switch]$UnsignedTestBuild,
@@ -21,9 +25,12 @@ if ($LASTEXITCODE -ne 0) {
     throw "引擎构建失败，退出码：$LASTEXITCODE"
 }
 
-if ($UnsignedTestBuild -and $LocalTestBuild) {
-    throw "-UnsignedTestBuild 和 -LocalTestBuild 不能同时使用。"
+$selectedModes = @($UnsignedReleaseBuild, $UnsignedTestBuild, $LocalTestBuild) |
+    Where-Object { $_ }
+if ($selectedModes.Count -gt 1) {
+    throw "-UnsignedReleaseBuild、-UnsignedTestBuild 和 -LocalTestBuild 只能选择一个。"
 }
+$isUnsignedBuild = $UnsignedReleaseBuild -or $UnsignedTestBuild
 
 # The installer recursively packages this directory. Publish into a clean
 # output tree so a prior run cannot carry stale engine files or runtime data.
@@ -117,7 +124,7 @@ if ($LocalTestBuild) {
         throw "本地证书不包含 Code Signing 用途：$certificateThumbprint"
     }
     $signTool = Get-SignTool
-} elseif (-not $UnsignedTestBuild) {
+} elseif (-not $isUnsignedBuild) {
     if ([string]::IsNullOrWhiteSpace($certificateThumbprint)) {
         throw "缺少 CSKIN_CODESIGN_CERT_SHA1。正式发布必须使用受信任的 Authenticode 证书；本地验证请显式使用 -UnsignedTestBuild。"
     }
@@ -207,7 +214,7 @@ foreach ($path in $requiredEngineFiles) {
     }
 }
 
-if (-not $UnsignedTestBuild) {
+if (-not $isUnsignedBuild) {
     # Keep the upstream cslol injection DLLs byte-for-byte intact. They carry
     # the vendor signature and are loaded inside the game process; replacing
     # that certificate with a local test signature can trigger anti-cheat or a
@@ -227,6 +234,7 @@ if (-not $UnsignedTestBuild) {
 
 New-Item -ItemType Directory -Force $outputDir | Out-Null
 $isccArguments = @()
+if ($UnsignedReleaseBuild) { $isccArguments += "/DUnsignedReleaseBuild=1" }
 if ($UnsignedTestBuild) { $isccArguments += "/DUnsignedTestBuild=1" }
 if ($LocalTestBuild) { $isccArguments += "/DLocalTestBuild=1" }
 $isccArguments += (Join-Path $PSScriptRoot "CskinSetup.iss")
@@ -235,7 +243,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup 编译失败，退出码：$LASTEXITCODE"
 }
 
-$installerFileName = if ($UnsignedTestBuild) {
+$installerFileName = if ($UnsignedReleaseBuild) {
+    "CskinSetup.exe"
+} elseif ($UnsignedTestBuild) {
     "CskinSetup-UNSIGNED-TEST.exe"
 } elseif ($LocalTestBuild) {
     "CskinSetup-LOCAL-SIGNED-TEST.exe"
@@ -243,7 +253,7 @@ $installerFileName = if ($UnsignedTestBuild) {
     "CskinSetup.exe"
 }
 $installerPath = Join-Path $outputDir $installerFileName
-if (-not $UnsignedTestBuild) {
+if (-not $isUnsignedBuild) {
     Sign-ReleaseFile -SignTool $signTool -CertificateThumbprint $certificateThumbprint -Path $installerPath -LocalTest:$LocalTestBuild
 }
 

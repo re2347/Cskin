@@ -58,6 +58,14 @@ $env:CSKIN_CODESIGN_CERT_SHA1 = "证书指纹"
 .\installer\build-installer.ps1
 ```
 
+经发布负责人明确接受 Windows“未知发布者”提示后，可显式生成无签名正式安装器：
+
+```powershell
+.\installer\build-installer.ps1 -UnsignedReleaseBuild
+```
+
+该模式输出正式文件 `installer-output\CskinSetup.exe`，不会签名任何程序文件；它与两个测试构建模式互斥，不能通过重命名测试包代替。
+
 正式构建会同时签名主程序、`Engine\Cskin.exe`、`Engine\tools\mod-tools.exe` 等关键 PE 文件；没有受信任证书时脚本会拒绝生成正式包。
 
 本地功能验证可显式生成未签名测试包：`.\installer\build-installer.ps1 -UnsignedTestBuild`；输出名为 `CskinSetup-UNSIGNED-TEST.exe`，不得分发。

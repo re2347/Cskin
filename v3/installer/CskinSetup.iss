@@ -5,6 +5,8 @@
 #define PublishDir "..\publish-final"
 #ifdef UnsignedTestBuild
   #define InstallerFileName "CskinSetup-UNSIGNED-TEST"
+#elif defined UnsignedReleaseBuild
+  #define InstallerFileName "CskinSetup"
 #elif defined LocalTestBuild
   #define InstallerFileName "CskinSetup-LOCAL-SIGNED-TEST"
 #else

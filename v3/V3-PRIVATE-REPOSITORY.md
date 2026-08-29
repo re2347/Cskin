@@ -137,6 +137,23 @@ service-role 配置。只通过平台控制台或交互式 CLI 写入，任何�
 当前网络访问 `workers.dev` 出现超时，但 Cloudflare 自定义域健康且已验证文件
 下载；`workers.dev` 仍保留为第三通道，不影响主通道和第一备用通道。
 
+## 2026-08-30 无签名正式发行
+
+发布负责人已明确取消用户端 Authenticode 签名，并接受 Windows 显示“未知发布者”
+提示。安装脚本新增独立的 `-UnsignedReleaseBuild` 模式：该模式不签名任何自有
+程序文件，正式输出名固定为 `CskinSetup.exe`，且不能与无签名测试或本地签名
+测试模式同时使用。发行物不是由测试包重命名得到。
+
+- 便携包 `PortableCskin.zip`：79,509,978 bytes，SHA-256
+  `20DE412109D1F8BDE12E39B1006B7D0BB5C035C38DE89E235DDBB7FC8D6BD062`。
+- 无签名安装包 `CskinSetup.exe`：68,539,836 bytes，文件版本 `0.3.0.0`，
+  SHA-256 `A1A5B24A1C3537026FABB95DC171B5CBFC41C7D1BEBB9388BCB40E0B2AC6407B`。
+- 安装器、安装后的 `PortableCskin.exe` 和 `Engine\Cskin.exe` 均验证为
+  `NotSigned`。
+- D 盘全新目录静默安装退出码 0，`skipifsilent` 验证通过；安装后的
+  `verify-portable.ps1 -Check all` 通过，确认引擎、应用、授权健康和无 Git
+  依赖；静默卸载退出码 0。
+
 ## 当前构建与正式发布条件
 
 - 便携包：`v3/PortableCskin.zip`，79,509,978 bytes，SHA-256
@@ -146,5 +163,6 @@ service-role 配置。只通过平台控制台或交互式 CLI 写入，任何�
   SHA-256 `33D4EF5B6D2C60E611A34BC24C7BF866CD0AF7A51A58E79249C72AD8DB5076EA`。
 
 本地测试安装包使用自签名证书，只用于验证安装链路，不得作为公开 Release。
-当前机器没有受信任的 Authenticode 代码签名证书；正式安装版需要提供受信任证书，
-或由发布负责人明确决定发布未签名版本。日常皮肤仓库内容更新不需要重新发布软件。
+当前正式发行按发布负责人的明确决定使用无签名安装包。未来如提供受信任的
+Authenticode 证书，仍可恢复默认的签名正式构建。日常皮肤仓库内容更新不需要
+重新发布软件。
