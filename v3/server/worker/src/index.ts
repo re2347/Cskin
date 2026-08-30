@@ -126,6 +126,7 @@ interface PrivateSkinIndexItem {
   id: number;
   path: string;
   name?: string;
+  nameEn?: string;
   blobSha?: string;
 }
 
@@ -152,6 +153,11 @@ interface PrivateSkinCatalogState {
   last_checked_at: number;
   updated_at: number;
   last_error: string | null;
+}
+
+interface SkinNamesPayload {
+  zh: Record<string, string>;
+  en: Record<string, string>;
 }
 
 interface GitCodeCompareFile {
@@ -555,6 +561,19 @@ function parseRecord<T>(value: string | null | undefined): Record<string, T> {
   }
 }
 
+function stringRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => typeof item === "string" && item.trim())) as Record<string, string>;
+}
+
+function parseSkinNames(value: string | null | undefined): SkinNamesPayload {
+  const parsed = parseRecord<unknown>(value);
+  const zh = stringRecord(parsed.zh);
+  const en = stringRecord(parsed.en);
+  if (Object.keys(zh).length === 0 && Object.keys(en).length === 0) return { zh: stringRecord(parsed), en: {} };
+  return { zh, en };
+}
+
 function skinIdFromPath(path: string): number | null {
   if (!isSafeSkinPath(path)) return null;
   const value = path.split("/").at(-1)?.replace(/\.fantome$/i, "") || "";
@@ -585,7 +604,7 @@ function buildPrivateSkinIndex(state?: PrivateSkinCatalogState | null): PrivateS
     BUILT_IN_PRIVATE_SKIN_INDEX.skins.map((skin) => [skin.id, { ...skin }]),
   );
   const overrides = parseRecord<PrivateSkinOverride>(state?.overrides_json);
-  const names = parseRecord<string>(state?.names_json);
+  const names = parseSkinNames(state?.names_json);
   for (const [idValue, override] of Object.entries(overrides)) {
     const skinId = Number(idValue);
     if (!Number.isSafeInteger(skinId) || skinId <= 0) continue;
@@ -598,13 +617,18 @@ function buildPrivateSkinIndex(state?: PrivateSkinCatalogState | null): PrivateS
     skins.set(skinId, {
       id: skinId,
       path: override.path,
-      name: names[idValue] || current?.name || "",
+      name: names.zh[idValue] || current?.name || "",
+      nameEn: names.en[idValue] || current?.nameEn,
       blobSha: override.blobSha || current?.blobSha,
     });
   }
-  for (const [idValue, name] of Object.entries(names)) {
+  for (const [idValue, name] of Object.entries(names.zh)) {
     const skin = skins.get(Number(idValue));
-    if (skin && typeof name === "string" && name.trim()) skin.name = name.trim();
+    if (skin && name.trim()) skin.name = name.trim();
+  }
+  for (const [idValue, name] of Object.entries(names.en)) {
+    const skin = skins.get(Number(idValue));
+    if (skin && name.trim()) skin.nameEn = name.trim();
   }
   return {
     ...BUILT_IN_PRIVATE_SKIN_INDEX,
@@ -662,12 +686,18 @@ async function refreshPrivateSkinCatalog(env: Env, force = false): Promise<Priva
       else overrides[String(skinId)] = { path: currentPath, blobSha: file.sha || undefined };
     }
 
-    let namesJson = state.names_json;
-    const namesResponse = await fetchPrivateRepositoryFile(config, "resources/zh/skin_ids.json");
-    if (namesResponse.ok) {
-      const names = await readBoundedJson<Record<string, string>>(namesResponse, 4 * 1024 * 1024);
-      namesJson = JSON.stringify(names);
-    }
+    const previousNames = parseSkinNames(state.names_json);
+    let namesJson = JSON.stringify(previousNames);
+    const [zhResponse, enResponse] = await Promise.all([
+      fetchPrivateRepositoryFile(config, "resources/zh/skin_ids.json"),
+      fetchPrivateRepositoryFile(config, "resources/en/skin_ids.json"),
+    ]);
+    const names = { zh: previousNames.zh, en: previousNames.en };
+    if (zhResponse.ok) names.zh = await readBoundedJson<Record<string, string>>(zhResponse, 4 * 1024 * 1024);
+    else console.warn(JSON.stringify({ event: "private_skin_names_zh_unavailable", status: zhResponse.status }));
+    if (enResponse.ok) names.en = await readBoundedJson<Record<string, string>>(enResponse, 4 * 1024 * 1024);
+    else console.warn(JSON.stringify({ event: "private_skin_names_en_unavailable", status: enResponse.status }));
+    namesJson = JSON.stringify(names);
     const overridesJson = JSON.stringify(overrides);
     await env.DB.prepare(
       "UPDATE private_skin_catalog_state SET current_revision = ?, overrides_json = ?, names_json = ?, last_checked_at = ?, updated_at = ?, last_error = NULL WHERE state_id = 1",

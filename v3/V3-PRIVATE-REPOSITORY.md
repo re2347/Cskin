@@ -7,12 +7,12 @@ v3 的唯一皮肤文件源是 GitCode 私有仓库 `Re2347/skin`，逻辑名称
 访问令牌。Supabase 是主授权与下载代理，Cloudflare Worker 是备用代理；不使用
 R2 或 Supabase Storage。
 
-版本号：`0.3.0`。
+版本号：`0.3.1`。
 
 ## 已实施架构
 
 ```text
-PortableCskin 0.3.0
+PortableCskin 0.3.1
   -> 有效授权租约
   -> Supabase Edge Function（主通道，一次）
   -> Cloudflare 自定义域名（备用，一次）
@@ -22,7 +22,7 @@ PortableCskin 0.3.0
 
 资源接口：
 
-- `GET /v1/skins/index`：返回当前仓库 revision、路径、名称和可用的 blob SHA。
+- `GET /v1/skins/index`：返回当前仓库 revision、路径、中文名称、可选英文名称和可用的 blob SHA。
 - `GET /v1/skins/file?skinId=<id>`：服务端从索引解析路径并流式转发单个
   `.fantome`，客户端不提交任意 GitCode 路径。
 - 两个代理都返回 `X-Cskin-Gateway`、`X-Cskin-Upstream` 和
@@ -64,7 +64,8 @@ HTTP 401/403、撤销、过期和签名错误不会继续切换代理。切换�
 Cloudflare Cron 也每五分钟检查一次。
 
 revision 改变后，服务端调用 GitCode compare API，只把新增、修改、删除和重命名
-的 `.fantome` 记录为覆盖项，同时刷新 `resources/zh/skin_ids.json` 名称。更新后的
+的 `.fantome` 记录为覆盖项，同时刷新 `resources/zh/skin_ids.json` 和
+`resources/en/skin_ids.json` 名称。更新后的
 目录从“内置索引 + 数据库覆盖项”生成。因此日常更新 `Re2347/skin` 后：
 
 - 不需要重新部署客户端。
@@ -74,6 +75,12 @@ revision 改变后，服务端调用 GitCode compare API，只把新增、修改
 
 只有仓库历史被强制重写到无法 compare、compare 返回截断结果、索引规则变化，
 或要更换仓库/分支时，才需要重新生成基线索引或修改服务端。
+
+## 2026-08-30 客户端检查前变更
+
+- Worker、Supabase 和索引生成脚本均支持 `nameEn`，兼容旧的中文名称 JSON 状态。
+- 客户端 `Skin.EnglishName` 仅参与 Wiki 预览匹配，不改变界面本地化显示。
+- 本轮只生成本地检查产物，不进行远程推送、部署或 Release 发布。
 
 ## 平台配置
 

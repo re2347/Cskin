@@ -45,7 +45,7 @@ public sealed class MainForm : Form
     // independent from the skin engine startup so the UI can sync as soon as
     // the League client is ready.
     private readonly System.Windows.Forms.Timer _clientSelectionTimer = new() { Interval = 700 };
-    private readonly System.Windows.Forms.Timer _repositoryRefreshTimer = new() { Interval = 10 * 60 * 1000 };
+    private readonly System.Windows.Forms.Timer _repositoryRefreshTimer = new() { Interval = 5 * 60 * 1000 };
     private readonly System.Windows.Forms.Timer _authorizationDisplayTimer = new() { Interval = 60 * 1000 };
     private readonly ChampionListPanel _championList = new();
     private readonly FlowLayoutPanel _skinGrid = new();
@@ -1097,8 +1097,7 @@ public sealed class MainForm : Form
 
     private async Task LoadPreviewImageAsync(Skin skin)
     {
-        await EnsureSkinPreviewCachedAsync(skin);
-        var image = await ImageCache.LoadAsync(skin.Image, skin.FallbackImage);
+        var image = await PreviewImageResolver.LoadAsync(skin, _lifetime.Token);
         if (IsDisposed || _selectedSkin?.Id != skin.Id)
         {
             image?.Dispose();
@@ -1112,8 +1111,7 @@ public sealed class MainForm : Form
         Image? image = null;
         try
         {
-            await EnsureSkinPreviewCachedAsync(skin, cancellationToken);
-            image = await ImageCache.LoadAsync(skin.Image, skin.FallbackImage);
+            image = await PreviewImageResolver.LoadAsync(skin, cancellationToken);
             cancellationToken.ThrowIfCancellationRequested();
             if (card.IsDisposed)
             {
@@ -1124,19 +1122,6 @@ public sealed class MainForm : Form
         }
         catch (OperationCanceledException) { }
         finally { image?.Dispose(); }
-    }
-
-    private async Task EnsureSkinPreviewCachedAsync(Skin skin, CancellationToken cancellationToken = default)
-    {
-        if (!skin.Chroma || !string.IsNullOrWhiteSpace(skin.LocalPreviewPath)) return;
-        try
-        {
-            await _repository.EnsurePreviewImagesAsync([skin.Id], cancellationToken);
-            if (!_repository.CachedPreviewPaths.TryGetValue(skin.Id, out var localPreview)) return;
-            skin.LocalPreviewPath = localPreview;
-            skin.Image = localPreview;
-        }
-        catch (OperationCanceledException) { }
     }
 
     private static Image CreateAvatarThumbnail(Image source, int size)
@@ -1303,7 +1288,14 @@ public sealed class MainForm : Form
             var ok = await _repository.SyncAsync(new Progress<string>(message => SetStatus(_applyStatus, message, Palette.Muted)), _lifetime.Token);
             if (ok)
             {
-                var merged = _catalog.MergeRepository(_repository.SkinPaths, _repository.SkinNames, _repository.CachedPreviewPaths);
+                if (_repository.LastSyncChanged)
+                {
+                    ImageCache.Clear();
+                    PreviewImageResolver.Clear();
+                    var revision = _repository.Revision;
+                    AppLog.Info($"皮肤目录 revision 已变化，清理预览图缓存：revision={revision[..Math.Min(12, revision.Length)]}");
+                }
+                var merged = _catalog.MergeRepository(_repository.SkinPaths, _repository.SkinNames, _repository.SkinEnglishNames, _repository.CachedPreviewPaths);
                 await _repository.UpdateEngineIndexAsync(_lifetime.Token);
                 if (_repository.LastSyncChanged || merged > 0)
                     await RefreshCatalogViewAsync();
@@ -2832,7 +2824,7 @@ internal sealed class ChromaPickerOption : Panel
         Image? image = null;
         try
         {
-            var source = await ImageCache.LoadAsync(_skin.Image, _skin.FallbackImage);
+            var source = await PreviewImageResolver.LoadAsync(_skin, cancellationToken);
             if (source is null) return;
             try
             {

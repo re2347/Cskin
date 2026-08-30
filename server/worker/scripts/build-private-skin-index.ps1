@@ -29,6 +29,11 @@ $namePath = Join-Path $root "resources\zh\skin_ids.json"
 if (Test-Path -LiteralPath $namePath) {
     $names = Get-Content -LiteralPath $namePath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
 }
+$englishNames = @{}
+$englishNamePath = Join-Path $root "resources\en\skin_ids.json"
+if (Test-Path -LiteralPath $englishNamePath) {
+    $englishNames = Get-Content -LiteralPath $englishNamePath -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+}
 
 $itemsById = @{}
 $treePaths = & git -C $root ls-tree -r --name-only HEAD -- skins
@@ -42,7 +47,8 @@ foreach ($pathValue in $treePaths) {
     }
     $skinId = [int]$Matches.id
     $name = if ($names.ContainsKey([string]$skinId)) { [string]$names[[string]$skinId] } else { "" }
-    $item = [ordered]@{ id = $skinId; path = $path; name = $name }
+    $nameEn = if ($englishNames.ContainsKey([string]$skinId)) { [string]$englishNames[[string]$skinId] } else { "" }
+    $item = [ordered]@{ id = $skinId; path = $path; name = $name; nameEn = $nameEn }
     if (-not $itemsById.ContainsKey($skinId)) {
         $itemsById[$skinId] = $item
         continue

@@ -2,7 +2,7 @@
 
 轻量化 Windows 原生皮肤选择器，使用本地 Cskin 引擎完成应用，皮肤资源按编号按需缓存。
 
-当前开发版本：**0.3.0**（Supabase 主通道、Cloudflare 备用、无客户端 Git 依赖、按需流式下载、
+当前开发版本：**0.3.1**（Supabase 主通道、Cloudflare 备用、无客户端 Git 依赖、按需流式下载、
 授权租约保护、覆盖层快速待命、LCU 阶段同步和 WAD 槽位冲突修复）。
 
 私有仓库架构、部署和验证记录见 `V3-PRIVATE-REPOSITORY.md`。

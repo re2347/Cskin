@@ -33,6 +33,12 @@ public static class ImageCache
         return await LoadAsync(fallbackUrl).ConfigureAwait(false);
     }
 
+    public static void Clear()
+    {
+        Cache.Clear();
+        while (Order.TryDequeue(out _)) { }
+    }
+
     private static async Task<byte[]?> DownloadAsync(string url)
     {
         try

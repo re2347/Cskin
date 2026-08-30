@@ -58,7 +58,7 @@ try {
         $validClock = [Diagnostics.Stopwatch]::StartNew()
         $device = [CskinNative.Services.DeviceIdentity]::LoadOrCreate()
         try {
-            $validResult = $validClient.VerifyAsync($lease, $device, "0.3.0").GetAwaiter().GetResult()
+            $validResult = $validClient.VerifyAsync($lease, $device, "0.3.1").GetAwaiter().GetResult()
         }
         finally {
             $device.Dispose()
@@ -92,7 +92,7 @@ try {
         $terminalClock = [Diagnostics.Stopwatch]::StartNew()
         $device = [CskinNative.Services.DeviceIdentity]::LoadOrCreate()
         try {
-            $terminalResult = $terminalClient.VerifyAsync($invalidLease, $device, "0.3.0").GetAwaiter().GetResult()
+            $terminalResult = $terminalClient.VerifyAsync($invalidLease, $device, "0.3.1").GetAwaiter().GetResult()
         }
         finally {
             $device.Dispose()

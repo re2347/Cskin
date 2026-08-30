@@ -67,6 +67,7 @@ interface PrivateSkinIndexItem {
   id: number;
   path: string;
   name?: string;
+  nameEn?: string;
   blobSha?: string;
 }
 
@@ -89,7 +90,7 @@ interface PrivateSkinCatalogState {
   state_id: number;
   current_revision: string;
   overrides_json: Record<string, PrivateSkinOverride>;
-  names_json: Record<string, string> | null;
+  names_json: unknown;
   last_checked_at: number;
   updated_at: number;
   last_error: string | null;
@@ -105,6 +106,11 @@ interface GitCodeCompareFile {
 interface GitCodeCompareResponse {
   files?: GitCodeCompareFile[];
   truncated?: boolean;
+}
+
+interface SkinNamesPayload {
+  zh: Record<string, string>;
+  en: Record<string, string>;
 }
 
 const corsHeaders = {
@@ -391,12 +397,28 @@ async function ensurePrivateSkinCatalogState(db: Database): Promise<PrivateSkinC
   return inserted.data;
 }
 
+function stringRecord(value: unknown): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  return Object.fromEntries(Object.entries(value).filter(([, item]) => typeof item === "string" && item.trim())) as Record<string, string>;
+}
+
+function parseSkinNames(value: unknown): SkinNamesPayload {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { zh: {}, en: {} };
+  const parsed = value as Record<string, unknown>;
+  const zh = stringRecord(parsed.zh);
+  const en = stringRecord(parsed.en);
+  // Older rows stored the Chinese map directly. Read that format without a
+  // migration so existing deployments can roll forward safely.
+  if (Object.keys(zh).length === 0 && Object.keys(en).length === 0) return { zh: stringRecord(parsed), en: {} };
+  return { zh, en };
+}
+
 function buildPrivateSkinIndex(state?: PrivateSkinCatalogState | null): PrivateSkinIndex {
   const skins = new Map<number, PrivateSkinIndexItem>(
     BUILT_IN_PRIVATE_SKIN_INDEX.skins.map((skin) => [skin.id, { ...skin }]),
   );
   const overrides = state?.overrides_json || {};
-  const names = state?.names_json || {};
+  const names = parseSkinNames(state?.names_json);
   for (const [idValue, override] of Object.entries(overrides)) {
     const skinId = Number(idValue);
     if (!Number.isSafeInteger(skinId) || skinId <= 0) continue;
@@ -409,13 +431,18 @@ function buildPrivateSkinIndex(state?: PrivateSkinCatalogState | null): PrivateS
     skins.set(skinId, {
       id: skinId,
       path: override.path,
-      name: names[idValue] || current?.name || "",
+      name: names.zh[idValue] || current?.name || "",
+      nameEn: names.en[idValue] || current?.nameEn,
       blobSha: override.blobSha || current?.blobSha,
     });
   }
-  for (const [idValue, name] of Object.entries(names)) {
+  for (const [idValue, name] of Object.entries(names.zh)) {
     const skin = skins.get(Number(idValue));
-    if (skin && typeof name === "string" && name.trim()) skin.name = name.trim();
+    if (skin && name.trim()) skin.name = name.trim();
+  }
+  for (const [idValue, name] of Object.entries(names.en)) {
+    const skin = skins.get(Number(idValue));
+    if (skin && name.trim()) skin.nameEn = name.trim();
   }
   return {
     ...BUILT_IN_PRIVATE_SKIN_INDEX,
@@ -469,11 +496,16 @@ async function refreshPrivateSkinCatalog(db: Database, force = false): Promise<P
       else overrides[String(skinId)] = { path: currentPath, blobSha: file.sha || undefined };
     }
 
-    let names = state.names_json;
-    const namesResponse = await fetchPrivateRepositoryFile(config, "resources/zh/skin_ids.json");
-    if (namesResponse.ok) {
-      names = await readBoundedJson<Record<string, string>>(namesResponse, 4 * 1024 * 1024);
-    }
+    const previousNames = parseSkinNames(state.names_json);
+    const names = { zh: previousNames.zh, en: previousNames.en };
+    const [zhResponse, enResponse] = await Promise.all([
+      fetchPrivateRepositoryFile(config, "resources/zh/skin_ids.json"),
+      fetchPrivateRepositoryFile(config, "resources/en/skin_ids.json"),
+    ]);
+    if (zhResponse.ok) names.zh = await readBoundedJson<Record<string, string>>(zhResponse, 4 * 1024 * 1024);
+    else console.warn(JSON.stringify({ event: "private_skin_names_zh_unavailable", status: zhResponse.status }));
+    if (enResponse.ok) names.en = await readBoundedJson<Record<string, string>>(enResponse, 4 * 1024 * 1024);
+    else console.warn(JSON.stringify({ event: "private_skin_names_en_unavailable", status: enResponse.status }));
     const updated: PrivateSkinCatalogState = {
       ...state,
       current_revision: nextRevision,

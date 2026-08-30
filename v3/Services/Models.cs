@@ -53,6 +53,12 @@ public sealed class Skin
     [JsonIgnore]
     public string? LocalizedName { get; set; }
 
+    // Remote-only skins may not exist in the bundled catalog yet. Keep their
+    // canonical English name so the Wiki fallback can match image titles even
+    // when the localized name is Chinese or unavailable.
+    [JsonIgnore]
+    public string? EnglishName { get; set; }
+
     // Some newly published chroma IDs do not have a public CDN thumbnail yet.
     // Keep the base skin artwork as a UI-only fallback so a missing chroma
     // image never turns the inspector or picker into an empty placeholder.

@@ -95,11 +95,14 @@ public sealed class LocalCatalog
     public int MergeRepository(
         IReadOnlyDictionary<int, string> paths,
         IReadOnlyDictionary<int, string> names,
+        IReadOnlyDictionary<int, string>? englishNames = null,
         IReadOnlyDictionary<int, string>? previewPaths = null)
     {
         if (paths.Count == 0) return 0;
 
         var existing = Champions.SelectMany(champion => champion.Skins).ToDictionary(skin => skin.Id);
+        var owners = Champions.SelectMany(champion => champion.Skins.Select(skin => (skin.Id, Champion: champion)))
+            .ToDictionary(pair => pair.Id, pair => pair.Champion);
         var champions = Champions.ToDictionary(champion => champion.Id);
         var changed = 0;
 
@@ -108,6 +111,14 @@ public sealed class LocalCatalog
             if (names.TryGetValue(skin.Id, out var name) && !string.Equals(skin.LocalizedName, name, StringComparison.Ordinal))
             {
                 skin.LocalizedName = name;
+                changed++;
+            }
+            if (englishNames is not null && englishNames.TryGetValue(skin.Id, out var englishName)
+                && !string.Equals(skin.EnglishName, englishName, StringComparison.Ordinal))
+            {
+                skin.EnglishName = englishName;
+                if (!string.Equals(skin.Name, englishName, StringComparison.Ordinal))
+                    skin.Name = englishName;
                 changed++;
             }
             if (previewPaths is not null && previewPaths.TryGetValue(skin.Id, out var existingPreview))
@@ -144,6 +155,7 @@ public sealed class LocalCatalog
                 Id = pair.Key,
                 Name = names.TryGetValue(pair.Key, out var localizedName) ? localizedName : $"皮肤 {pair.Key}",
                 LocalizedName = names.TryGetValue(pair.Key, out localizedName) ? localizedName : null,
+                EnglishName = englishNames is not null && englishNames.TryGetValue(pair.Key, out var englishName) ? englishName : null,
                 ChampionId = championId,
                 ChampionName = champion.Name,
                 Slug = champion.Slug,
@@ -156,7 +168,60 @@ public sealed class LocalCatalog
             if (!string.IsNullOrWhiteSpace(skin.LocalPreviewPath)) skin.Image = skin.LocalPreviewPath;
             champion.Skins.Add(skin);
             existing[pair.Key] = skin;
+            owners[pair.Key] = champion;
             changed++;
+        }
+
+        // A repository revision may move a package to a different base-skin
+        // directory or change its chroma relationship without changing the
+        // numeric id. Reparent and rebuild its preview fields before pruning
+        // unavailable entries so the UI grouping follows the remote tree.
+        foreach (var pair in paths)
+        {
+            if (!existing.TryGetValue(pair.Key, out var skin)
+                || !TryParseRepositoryPath(pair.Value, out var championId, out var baseSkinId)) continue;
+            if (!champions.TryGetValue(championId, out var champion))
+            {
+                var championName = names.TryGetValue(championId * 1000, out var localizedChampion)
+                    ? localizedChampion
+                    : $"英雄 {championId}";
+                champion = new Champion
+                {
+                    Id = championId,
+                    Name = championName,
+                    Slug = $"Champion{championId}",
+                    Icon = ChampionIcon(championId)
+                };
+                champions[championId] = champion;
+                Champions.Add(champion);
+                changed++;
+            }
+            if (owners.TryGetValue(pair.Key, out var previousOwner) && previousOwner.Id != championId)
+            {
+                previousOwner.Skins.Remove(skin);
+                champion.Skins.Add(skin);
+                owners[pair.Key] = champion;
+                changed++;
+            }
+            var isChroma = pair.Key != baseSkinId;
+            var expectedImage = previewPaths?.GetValueOrDefault(pair.Key)
+                ?? SkinImage(championId, pair.Key, isChroma, champion.Slug);
+            var expectedFallback = SkinFallbackImage(championId, pair.Key, isChroma, baseSkinId, champion.Slug);
+            if (skin.ChampionId != championId || skin.BaseSkinId != baseSkinId || skin.Chroma != isChroma
+                || !string.Equals(skin.LocalPreviewPath, previewPaths?.GetValueOrDefault(pair.Key), StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(skin.Image, expectedImage, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(skin.FallbackImage, expectedFallback, StringComparison.OrdinalIgnoreCase))
+            {
+                skin.ChampionId = championId;
+                skin.ChampionName = champion.Name;
+                skin.Slug = champion.Slug;
+                skin.BaseSkinId = baseSkinId;
+                skin.Chroma = isChroma;
+                skin.LocalPreviewPath = previewPaths?.GetValueOrDefault(pair.Key);
+                skin.Image = expectedImage;
+                skin.FallbackImage = expectedFallback;
+                changed++;
+            }
         }
 
         var available = paths.Keys.ToHashSet();

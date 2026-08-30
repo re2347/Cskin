@@ -30,6 +30,7 @@ public sealed class SkinRepository
     private readonly SemaphoreSlim _indexPrimeGate = new(1, 1);
     private ConcurrentDictionary<int, string> _paths = [];
     private ConcurrentDictionary<int, string> _names = [];
+    private ConcurrentDictionary<int, string> _englishNames = [];
     private ConcurrentDictionary<int, string> _blobShas = [];
     private ConcurrentDictionary<int, string> _previewPaths = [];
     private string? _portableRoot;
@@ -41,12 +42,14 @@ public sealed class SkinRepository
 
     public string RepositoryPath => $"{RepositoryLabel} via Supabase/Cloudflare";
     public string RepositoryUrl => PrivateRepositoryUrl;
+    public string Revision => _revision;
     public int RemoteSkinCount => _paths.Count;
     public bool IsReady => _paths.Count > 0;
     public bool IsSyncing => Volatile.Read(ref _syncInProgress) != 0;
     public bool LastSyncChanged { get; private set; }
     public IReadOnlyDictionary<int, string> SkinPaths => _paths;
     public IReadOnlyDictionary<int, string> SkinNames => _names;
+    public IReadOnlyDictionary<int, string> SkinEnglishNames => _englishNames;
     public IReadOnlyDictionary<int, string> CachedPreviewPaths => _previewPaths;
 
     public void SetPortableRoot(string? portableRoot) => _portableRoot = portableRoot;
@@ -138,12 +141,14 @@ public sealed class SkinRepository
 
             var paths = new Dictionary<int, string>();
             var names = new Dictionary<int, string>();
+            var englishNames = new Dictionary<int, string>();
             var blobShas = new Dictionary<int, string>();
             foreach (var skin in remote.Skins)
             {
                 if (skin.Id <= 0 || !TryNormalizeSkinPath(skin.Path, skin.Id, out var normalized)) continue;
                 paths.TryAdd(skin.Id, normalized);
                 if (!string.IsNullOrWhiteSpace(skin.Name)) names[skin.Id] = skin.Name.Trim();
+                if (!string.IsNullOrWhiteSpace(skin.NameEn)) englishNames[skin.Id] = skin.NameEn.Trim();
                 if (IsGitObjectId(skin.BlobSha)) blobShas[skin.Id] = skin.BlobSha.Trim();
             }
             if (paths.Count == 0)
@@ -155,6 +160,7 @@ public sealed class SkinRepository
             var previousRevision = _revision;
             _paths = new ConcurrentDictionary<int, string>(paths);
             _names = new ConcurrentDictionary<int, string>(MergeNames(names));
+            _englishNames = new ConcurrentDictionary<int, string>(MergeNames(englishNames, _englishNames));
             _blobShas = new ConcurrentDictionary<int, string>(blobShas);
             _previewPaths = [];
             _revision = remote.Revision ?? "";
@@ -194,6 +200,7 @@ public sealed class SkinRepository
             }
             _paths = new ConcurrentDictionary<int, string>(paths);
             _names = new ConcurrentDictionary<int, string>(await LoadNamesFromFilesAsync(cancellationToken));
+            _englishNames = new ConcurrentDictionary<int, string>(await LoadNamesFromFilesAsync(cancellationToken, "skin_names_en_US.json"));
             progress?.Report($"随包资源索引已就绪 · {_paths.Count:N0} 个皮肤");
             AppLog.Info($"随包皮肤路径索引已就绪：skins={_paths.Count}；远程更新通过 Supabase/Cloudflare 获取");
             return true;
@@ -450,23 +457,27 @@ public sealed class SkinRepository
     {
         var paths = new Dictionary<int, string>();
         var names = new Dictionary<int, string>();
+        var englishNames = new Dictionary<int, string>();
         var blobShas = new Dictionary<int, string>();
         foreach (var skin in index.Skins)
         {
             if (skin.Id <= 0 || !TryNormalizeSkinPath(skin.Path, skin.Id, out var path)) continue;
             paths.TryAdd(skin.Id, path);
             if (!string.IsNullOrWhiteSpace(skin.Name)) names[skin.Id] = skin.Name.Trim();
+            if (!string.IsNullOrWhiteSpace(skin.NameEn)) englishNames[skin.Id] = skin.NameEn.Trim();
             if (IsGitObjectId(skin.BlobSha)) blobShas[skin.Id] = skin.BlobSha.Trim();
         }
         _paths = new ConcurrentDictionary<int, string>(paths);
         _names = new ConcurrentDictionary<int, string>(MergeNames(names));
+        _englishNames = new ConcurrentDictionary<int, string>(MergeNames(englishNames, _englishNames));
         _blobShas = new ConcurrentDictionary<int, string>(blobShas);
         _revision = index.Revision ?? "";
     }
 
-    private Dictionary<int, string> MergeNames(Dictionary<int, string> remoteNames)
+    private Dictionary<int, string> MergeNames(Dictionary<int, string> remoteNames, IReadOnlyDictionary<int, string>? existing = null)
     {
-        foreach (var pair in _names) remoteNames.TryAdd(pair.Key, pair.Value);
+        existing ??= _names;
+        foreach (var pair in existing) remoteNames.TryAdd(pair.Key, pair.Value);
         return remoteNames;
     }
 
@@ -613,10 +624,10 @@ public sealed class SkinRepository
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException) { return false; }
     }
 
-    private static async Task<Dictionary<int, string>> LoadNamesFromFilesAsync(CancellationToken cancellationToken)
+    private static async Task<Dictionary<int, string>> LoadNamesFromFilesAsync(CancellationToken cancellationToken, string fileName = "skin_names_zh_CN.json")
     {
         var result = new Dictionary<int, string>();
-        var path = AppPaths.Asset("skin_names_zh_CN.json");
+        var path = AppPaths.Asset(fileName);
         if (!File.Exists(path)) return result;
         try
         {
@@ -736,6 +747,7 @@ public sealed class SkinRepository
         public int Id { get; set; }
         public string Path { get; set; } = "";
         public string Name { get; set; } = "";
+        public string NameEn { get; set; } = "";
         public string BlobSha { get; set; } = "";
     }
 }
