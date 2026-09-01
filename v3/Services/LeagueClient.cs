@@ -90,8 +90,8 @@ public sealed class LeagueClient : IDisposable
             await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken);
             using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken);
             var root = document.RootElement;
-            var localCellId = GetInt(root, "localPlayerCellId");
-            var currentSummonerId = localCellId > 0 ? 0 : await ReadCurrentSummonerIdAsync(cancellationToken);
+            var hasLocalCellId = TryGetInt(root, "localPlayerCellId", out var localCellId) && localCellId >= 0;
+            var currentSummonerId = hasLocalCellId ? 0 : await ReadCurrentSummonerIdAsync(cancellationToken);
             var selection = ParseSelection(root, currentSummonerId);
             AppLog.InfoThrottled(
                 "lcu-selection-result",
@@ -230,10 +230,22 @@ public sealed class LeagueClient : IDisposable
             var gameData = root.TryGetProperty("gameData", out var data) && data.ValueKind == JsonValueKind.Object
                 ? data
                 : default;
+            var playerSelectionCount = CountArray(gameData, "playerChampionSelections");
+            var teamOneCount = CountArray(gameData, "teamOne");
+            var teamTwoCount = CountArray(gameData, "teamTwo");
             AppLog.InfoThrottled(
                 "lcu-gameflow-session-result",
-                $"LCU 游戏流会话解析：phase={selection.Phase} playerChampionSelections={CountArray(gameData, "playerChampionSelections")} teamOne={CountArray(gameData, "teamOne")} teamTwo={CountArray(gameData, "teamTwo")} championId={selection.ResolvedChampionId} selectedSkinId={selection.SelectedSkinId} summonerId={currentSummonerId}",
+                $"LCU 游戏流会话解析：phase={selection.Phase} playerChampionSelections={playerSelectionCount} teamOne={teamOneCount} teamTwo={teamTwoCount} championId={selection.ResolvedChampionId} selectedSkinId={selection.SelectedSkinId} summonerId={currentSummonerId}",
                 TimeSpan.FromSeconds(5));
+            if (selection.ResolvedChampionId <= 0
+                && IsLiveGameflowSelectionPhase(selection.Phase)
+                && playerSelectionCount + teamOneCount + teamTwoCount > 0)
+            {
+                AppLog.InfoThrottled(
+                    "lcu-gameflow-local-identity-miss",
+                    $"LCU 游戏流候选已忽略：未匹配到当前用户 summonerId={currentSummonerId} phase={selection.Phase}",
+                    TimeSpan.FromSeconds(5));
+            }
             return selection;
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested) { return null; }
@@ -244,43 +256,48 @@ public sealed class LeagueClient : IDisposable
     private static ChampionSelection ParseGameflowSelection(JsonElement root, long currentSummonerId)
     {
         var phase = GetString(root, "phase");
+        if (!IsLiveGameflowSelectionPhase(phase))
+            return new ChampionSelection { Available = true, Phase = phase };
         if (!root.TryGetProperty("gameData", out var gameData) || gameData.ValueKind != JsonValueKind.Object)
             return new ChampionSelection { Available = true, Phase = phase };
 
-            JsonElement? local = null;
-            var candidates = new List<JsonElement>();
-            foreach (var propertyName in new[] { "playerChampionSelections", "teamOne", "teamTwo" })
+        JsonElement? local = null;
+        foreach (var propertyName in new[] { "playerChampionSelections", "teamOne", "teamTwo" })
+        {
+            if (!gameData.TryGetProperty(propertyName, out var entries) || entries.ValueKind != JsonValueKind.Array) continue;
+            foreach (var entry in entries.EnumerateArray())
             {
-                if (!gameData.TryGetProperty(propertyName, out var entries) || entries.ValueKind != JsonValueKind.Array) continue;
-                foreach (var entry in entries.EnumerateArray())
-                {
-                    if (GetInt(entry, "championId") <= 0) continue;
-                    candidates.Add(entry);
-                    var summonerId = GetLong(entry, "summonerId");
-                    if (currentSummonerId > 0 && summonerId == currentSummonerId) local = entry;
-                }
+                if (GetInt(entry, "championId") <= 0) continue;
+                var summonerId = GetLong(entry, "summonerId");
+                if (GetBool(entry, "isLocalPlayer")
+                    || (currentSummonerId > 0 && summonerId == currentSummonerId))
+                    local = entry;
             }
+        }
 
-            var selected = local ?? (candidates.Count == 1 ? candidates[0] : (JsonElement?)null);
-            if (selected is not JsonElement value)
-                return new ChampionSelection { Available = true, Phase = phase };
+        // Gameflow can retain every player's previous selection. A sole
+        // candidate is not proof that it belongs to this user, so only an
+        // explicit local-player identity may drive UI synchronization.
+        var selected = local;
+        if (selected is not JsonElement value)
+            return new ChampionSelection { Available = true, Phase = phase };
 
-            var championId = GetInt(value, "championId");
-            var selectedSkinId = GetInt(value, "selectedSkinId");
-            if (selectedSkinId <= 0) selectedSkinId = GetInt(value, "skinId");
-            if (selectedSkinId <= 0)
-            {
-                var skinIndex = GetInt(value, "selectedSkinIndex");
-                if (skinIndex >= 0) selectedSkinId = championId * 1000 + skinIndex;
-            }
-            if (selectedSkinId / 1000 != championId) selectedSkinId = championId * 1000;
-            return new ChampionSelection
-            {
-                Available = true,
-                ChampionId = championId,
-                SelectedSkinId = selectedSkinId,
-                Phase = phase
-            };
+        var championId = GetInt(value, "championId");
+        var selectedSkinId = GetInt(value, "selectedSkinId");
+        if (selectedSkinId <= 0) selectedSkinId = GetInt(value, "skinId");
+        if (selectedSkinId <= 0)
+        {
+            var skinIndex = GetInt(value, "selectedSkinIndex");
+            if (skinIndex >= 0) selectedSkinId = championId * 1000 + skinIndex;
+        }
+        if (selectedSkinId / 1000 != championId) selectedSkinId = championId * 1000;
+        return new ChampionSelection
+        {
+            Available = true,
+            ChampionId = championId,
+            SelectedSkinId = selectedSkinId,
+            Phase = phase
+        };
     }
 
     private async Task<long> ReadCurrentSummonerIdAsync(CancellationToken cancellationToken)
@@ -819,7 +836,7 @@ public sealed class LeagueClient : IDisposable
 
     private static ChampionSelection ParseSelection(JsonElement session, long currentSummonerId)
     {
-        var localCellId = GetInt(session, "localPlayerCellId");
+        var hasLocalCellId = TryGetInt(session, "localPlayerCellId", out var localCellId) && localCellId >= 0;
         var championId = GetInt(session, "championId");
         var championPickIntent = GetInt(session, "championPickIntent");
         var selectedSkinId = 0;
@@ -831,7 +848,7 @@ public sealed class LeagueClient : IDisposable
                 var playerCellId = GetInt(player, "cellId");
                 var playerSummonerId = GetLong(player, "summonerId");
                 var isLocal = GetBool(player, "isLocalPlayer")
-                    || (localCellId > 0 && playerCellId == localCellId)
+                    || (hasLocalCellId && playerCellId == localCellId)
                     || (currentSummonerId > 0 && playerSummonerId == currentSummonerId);
                 if (!isLocal) continue;
                 championId = GetInt(player, "championId") > 0 ? GetInt(player, "championId") : championId;
@@ -852,8 +869,10 @@ public sealed class LeagueClient : IDisposable
                 {
                     if (!string.Equals(GetString(action, "type"), "pick", StringComparison.OrdinalIgnoreCase)) continue;
                     var actorCellId = GetInt(action, "actorCellId");
-                    if (localCellId > 0 && actorCellId != localCellId) continue;
-                    if (localCellId <= 0 && actorCellId <= 0) continue;
+                    // Cell 0 is a valid local slot. If the response omitted
+                    // localPlayerCellId entirely, actions cannot be tied to
+                    // the current player and must not override myTeam data.
+                    if (!hasLocalCellId || actorCellId != localCellId) continue;
                     championId = GetInt(action, "championId") > 0 ? GetInt(action, "championId") : championId;
                     championPickIntent = GetInt(action, "championPickIntent") > 0
                         ? GetInt(action, "championPickIntent")
@@ -881,6 +900,20 @@ public sealed class LeagueClient : IDisposable
         if (value.ValueKind == JsonValueKind.Number && value.TryGetInt32(out var number)) return number;
         return value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out number) ? number : 0;
     }
+
+    private static bool TryGetInt(JsonElement element, string name, out int result)
+    {
+        result = 0;
+        if (!element.TryGetProperty(name, out var value)) return false;
+        if (value.ValueKind == JsonValueKind.Number) return value.TryGetInt32(out result);
+        return value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), out result);
+    }
+
+    private static bool IsLiveGameflowSelectionPhase(string phase) =>
+        phase.Equals("ChampSelect", StringComparison.OrdinalIgnoreCase)
+        || phase.Equals("GameStart", StringComparison.OrdinalIgnoreCase)
+        || phase.Equals("InProgress", StringComparison.OrdinalIgnoreCase)
+        || phase.Equals("Reconnect", StringComparison.OrdinalIgnoreCase);
 
     private static long GetLong(JsonElement element, string name)
     {

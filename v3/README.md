@@ -24,7 +24,9 @@
 程序只使用本地引擎接口，不会自动打开旧网页端。
 
 客户端同步：程序每 700 毫秒读取国服 League Client 的 LCU
-`/lol-champ-select/v1/session`，在客户端悬停、锁定或更换英雄时自动切换左侧英雄和皮肤目录；LCU 暂不可用时才回退到本地引擎的 `/api/champion-selection` 接口。
+`/lol-champ-select/v1/session`。新的英雄编号连续出现两次后才同步一次左侧目录，
+单次异常数据不会切换英雄；同步完成后，用户仍可在软件中手动浏览其他英雄，轮询不会持续拉回。
+LCU 暂不可用时才回退到本地引擎的 `/api/champion-selection` 接口。
 
 LCU 诊断：运行 `diagnostics\collect-lcu-diagnostic.ps1` 可在 `diagnostics` 目录生成脱敏诊断日志（不会写入令牌）。应用日志会记录 LCU 接口状态码、游戏流阶段、候选队伍数量和最终解析的英雄/皮肤编号。WeGame 下 `LeagueClient\lockfile` 为空时属于正常情况，程序会改用客户端进程参数、PowerShell 或随包 `Engine\wmic.exe` 获取端口和令牌。
 

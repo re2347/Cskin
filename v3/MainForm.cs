@@ -90,6 +90,7 @@ public sealed class MainForm : Form
     private int _lastClientSkinId;
     private DateTime _lastClientSelectionUtc;
     private int _clientSelectionMisses;
+    private readonly ClientSelectionStabilizer _clientSelectionStabilizer = new(requiredSamples: 2);
     private int _lastAppliedSkinId;
     private int _lastAppliedTargetSkinId;
     private int _disposed;
@@ -917,6 +918,8 @@ public sealed class MainForm : Form
                 if (++_clientSelectionMisses >= 3)
                 {
                     _lastClientChampionId = 0;
+                    _lastClientSkinId = 0;
+                    _clientSelectionStabilizer.Reset();
                     if (lcuSelection is { Available: true })
                     {
                         var phase = string.IsNullOrWhiteSpace(lcuSelection.Phase) ? "未知" : lcuSelection.Phase;
@@ -933,28 +936,50 @@ public sealed class MainForm : Form
             }
             _clientSelectionMisses = 0;
             var selectedSkinId = selection?.SelectedSkinId ?? 0;
-            _lastClientSkinId = selectedSkinId > 0
+            var normalizedSkinId = selectedSkinId > 0
                 && selectedSkinId / 1000 == championId
                 ? selectedSkinId
                 : championId * 1000;
             _lastClientSelectionUtc = DateTime.UtcNow;
-            // Compare against the visible selection as well as the last
-            // response. This keeps synchronization working when the catalog
-            // finishes loading after the first poll, or when the user changed
-            // the selection manually in the app.
-            if (_selectedChampion?.Id == championId)
+            var source = ReferenceEquals(selection, lcuSelection) ? "LCU" : "engine";
+            var observation = _clientSelectionStabilizer.Observe(championId, normalizedSkinId);
+            if (!observation.IsStable)
             {
-                _lastClientChampionId = championId;
+                AppLog.Info(
+                    $"客户端英雄候选等待稳定：source={source} championId={championId} skinId={normalizedSkinId} " +
+                    $"phase={selection?.Phase} samples={observation.ConsecutiveSamples}/2");
                 return;
             }
-            var champion = _champions.FirstOrDefault(item => item.Id == championId);
-            if (champion is null) return;
-            var championChanged = _selectedChampion?.Id != championId;
+
+            // Keep the target skin current after it is stable, but emit a UI
+            // synchronization only once per actual LCU champion change. This
+            // lets the user browse another champion in the app without the
+            // 700 ms poller repeatedly pulling the UI back.
+            _lastClientSkinId = normalizedSkinId;
+            if (!observation.ShouldSynchronize)
+            {
+                AppLog.InfoThrottled(
+                    "lcu-selection-steady",
+                    $"客户端英雄保持不变，不重复覆盖界面：source={source} championId={championId} skinId={normalizedSkinId} phase={selection?.Phase}",
+                    TimeSpan.FromSeconds(10));
+                return;
+            }
+
             _lastClientChampionId = championId;
+            var champion = _champions.FirstOrDefault(item => item.Id == championId);
+            if (champion is null)
+            {
+                AppLog.Warn($"客户端英雄已稳定但本地目录未找到：source={source} championId={championId} phase={selection?.Phase}");
+                return;
+            }
+            var championChanged = _selectedChampion?.Id != championId;
             if (championChanged)
             {
                 await SelectChampionAsync(champion);
                 SetStatus(_applyStatus, $"已同步客户端英雄 · {champion.Name}", Palette.Success);
+                AppLog.Info(
+                    $"客户端英雄同步已接受：source={source} championId={championId} champion={champion.Name} " +
+                    $"skinId={normalizedSkinId} phase={selection?.Phase} samples={observation.ConsecutiveSamples}");
                 // Applying a remembered skin is deliberately detached from
                 // the polling loop. A slow download or engine request must
                 // never prevent the next champion selection from being read.
