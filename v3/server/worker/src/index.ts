@@ -188,6 +188,20 @@ const REQUEST_NONCE_TTL_SECONDS = 10 * 60;
 const DEVICE_KEY_RECOVERY_COOLDOWN_SECONDS = 7 * 24 * 60 * 60;
 const PRIVATE_SKIN_REFRESH_SECONDS = 5 * 60;
 
+const CLIENT_VERSION_MANIFEST = {
+  schema: 1,
+  sequence: 1,
+  channel: "stable",
+  latestVersion: "0.4.0",
+  minimumVersion: "0.4.0",
+  title: "请更新到最新版本",
+  message: "当前版本已停止使用，请下载最新版本。",
+  downloadUrl: "https://wwboj.lanzoum.com/b01euq54ah",
+  downloadPassword: "c1le",
+  groupNumber: "712178830",
+  effectiveAt: "2026-09-08T00:00:00Z",
+} as const;
+
 function nowSeconds(): number {
   return Math.floor(Date.now() / 1000);
 }
@@ -1881,6 +1895,12 @@ export default {
     const url = new URL(request.url);
     const id = requestId(request);
     if (request.method === "OPTIONS") return corsEmpty();
+    if (request.method === "GET" && url.pathname === "/v1/client/version") {
+      return json(CLIENT_VERSION_MANIFEST, 200, {
+        "Cache-Control": "no-store",
+        "X-Cskin-Version-Sequence": String(CLIENT_VERSION_MANIFEST.sequence),
+      });
+    }
     if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
       return url.pathname === "/health" ? health(env, id) : json({ ok: true, service: "cskin-license-worker", environment: env.ENVIRONMENT || "unknown", requestId: id });
     }

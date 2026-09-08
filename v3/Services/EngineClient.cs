@@ -36,8 +36,9 @@ public sealed class EngineClient : IDisposable
         // short (they use their own linked token) while allowing API writes
         // enough time to finish instead of reporting a false apply failure.
         // Apply returns as soon as runoverlay is armed; the engine observes DLL
-        // redirection in the background. Keep this above the bounded 180-second
-        // mkoverlay timeout so a slow disk reports the engine's concrete error.
+        // redirection in the background. The host application applies its own
+        // short deadline; the engine subprocess keeps its independent timeout
+        // so its concrete error can still be logged.
         _http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(200) };
     }
 

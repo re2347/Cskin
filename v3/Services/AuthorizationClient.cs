@@ -39,6 +39,9 @@ public sealed class AuthorizationClient : IDisposable
 
     private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web);
     private static readonly TimeSpan RequestTimeout = TimeSpan.FromSeconds(10);
+    // Endpoint preference belongs to the client instance so an emergency
+    // Cloudflare-first client cannot change the normal Supabase-first order.
+    private int _preferredEndpoint;
     private readonly HttpClient _http;
     private readonly IReadOnlyList<Uri> _endpoints;
 
@@ -94,18 +97,24 @@ public sealed class AuthorizationClient : IDisposable
         CancellationToken cancellationToken)
     {
         ApiCallResult<TResponse>? last = null;
+        var start = Math.Abs(Volatile.Read(ref _preferredEndpoint));
         for (var attempt = 0; attempt < _endpoints.Count; attempt++)
         {
             cancellationToken.ThrowIfCancellationRequested();
+            var endpointIndex = (start + attempt) % _endpoints.Count;
             var result = await PostAsync<TRequest, TResponse>(
-                _endpoints[attempt],
+                _endpoints[endpointIndex],
                 path,
                 requestFactory(),
                 cancellationToken).ConfigureAwait(false);
-            if (result.Succeeded) return result;
+            if (result.Succeeded)
+            {
+                Interlocked.Exchange(ref _preferredEndpoint, endpointIndex);
+                return result;
+            }
 
             last = result;
-            if (attempt + 1 >= _endpoints.Count || !ShouldTryNextEndpoint(result, _endpoints[attempt])) break;
+            if (attempt + 1 >= _endpoints.Count || !ShouldTryNextEndpoint(result)) break;
             await Task.Delay(TimeSpan.FromMilliseconds(250 + (attempt * 500)), cancellationToken).ConfigureAwait(false);
         }
 
@@ -147,17 +156,12 @@ public sealed class AuthorizationClient : IDisposable
         }
     }
 
-    private static bool ShouldTryNextEndpoint<T>(ApiCallResult<T> result, Uri endpoint)
+    private static bool ShouldTryNextEndpoint<T>(ApiCallResult<T> result)
     {
-        var statusCode = (int)result.StatusCode;
-        if (statusCode is 401 or 403
-            || result.ErrorCode is "LICENSE_REVOKED" or "LICENSE_EXPIRED" or "INVALID_LEASE" or "INVALID_SIGNATURE")
-            return false;
-        if (result.ErrorCode is "LICENSE_NOT_FOUND" or "LICENSE_ALREADY_BOUND" or "DEVICE_KEY_CHANGED")
-            return endpoint.Host.EndsWith("supabase.co", StringComparison.OrdinalIgnoreCase);
-        return result.ErrorCode is "AUTH_TIMEOUT" or "AUTH_UNREACHABLE" or "INVALID_RESPONSE"
-            || statusCode is 408 or 429
-            || statusCode >= 500;
+        return AuthorizationFailoverPolicy.ShouldTryNext(
+            result.StatusCode,
+            result.ErrorCode,
+            result.ErrorCode is "AUTH_TIMEOUT" or "AUTH_UNREACHABLE" or "INVALID_RESPONSE");
     }
 
     private static Uri ParseEndpoint(string value)
