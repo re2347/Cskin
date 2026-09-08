@@ -67,8 +67,11 @@ public sealed class MainForm : Form
     private readonly RoundedButton _settingsButton;
     private readonly RoundedButton _prevPageButton;
     private readonly RoundedButton _nextPageButton;
+    private readonly Panel _skinPager = new();
     private readonly LoadingBar _applyProgress = new();
+    private readonly ApplyOperationController _applyOperations = new();
     private readonly TableLayoutPanel _workspace = new();
+    private readonly TableLayoutPanel _catalogLayout = new();
     private readonly Panel _inspectorPane = new();
     private readonly Panel _catalogPane = new();
     private LocalCatalog _catalog = new();
@@ -93,6 +96,7 @@ public sealed class MainForm : Form
     private readonly ClientSelectionStabilizer _clientSelectionStabilizer = new(requiredSamples: 2);
     private int _lastAppliedSkinId;
     private int _lastAppliedTargetSkinId;
+    private bool _catalogViewReady;
     private int _disposed;
 
     public bool RequestLicenseChange { get; private set; }
@@ -479,7 +483,11 @@ public sealed class MainForm : Form
         _catalogPane.Dock = DockStyle.Fill;
         _catalogPane.BackColor = Palette.Canvas;
         _catalogPane.Padding = new Padding(20, 16, 16, 0);
-        var layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 4, BackColor = Color.Transparent };
+        var layout = _catalogLayout;
+        layout.Dock = DockStyle.Fill;
+        layout.ColumnCount = 1;
+        layout.RowCount = 4;
+        layout.BackColor = Color.Transparent;
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 116));
         layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 50));
         layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
@@ -539,7 +547,10 @@ public sealed class MainForm : Form
         _skinGrid.Resize += (_, _) => UpdateSkinCardWidths();
         layout.Controls.Add(_skinGrid, 0, 2);
 
-        var pager = new Panel { Dock = DockStyle.Fill, BackColor = Color.Transparent };
+        var pager = _skinPager;
+        pager.Dock = DockStyle.Fill;
+        pager.BackColor = Color.Transparent;
+        pager.Visible = false;
         _prevPageButton.Location = new Point(0, 3);
         _prevPageButton.Click += (_, _) => ChangeSkinPage(-1);
         pager.Controls.Add(_prevPageButton);
@@ -622,7 +633,11 @@ public sealed class MainForm : Form
         try
         {
             _catalog = await LocalCatalog.LoadAsync(_lifetime.Token);
-            await RefreshCatalogViewAsync();
+            // Do not render the bundled index here. It can be older than the
+            // private repository and would make the first page visibly jump
+            // when the remote sync completes.
+            _catalogHint.Text = "同步中";
+            SetStatus(_applyStatus, "正在同步最新皮肤目录…", Palette.Muted);
             // LCU polling is useful before the local skin engine has finished
             // booting. Start it as soon as the catalog exists; the poller will
             // use the engine endpoint only as a compatibility fallback.
@@ -655,7 +670,17 @@ public sealed class MainForm : Form
             SetStatus(_applyStatus, "本地引擎未连接", Palette.Error);
             _applyButton.Enabled = false;
         }
-        await SyncRepositoryAsync();
+        var repositoryReady = await SyncRepositoryAsync();
+        if (!_catalogViewReady
+            && CatalogStartupPolicy.ShouldRenderInitial(
+                syncCompleted: true,
+                syncSucceeded: repositoryReady,
+                localCatalogAvailable: _catalog.Champions.Count > 0))
+        {
+            AppLog.Info($"首次资源同步完成，渲染最终皮肤目录：remoteReady={repositoryReady} champions={_catalog.Champions.Count}");
+            await RefreshCatalogViewAsync();
+            _catalogViewReady = true;
+        }
         _repositoryRefreshTimer.Start();
         await AutoApplyRememberedSelectionAsync();
     }
@@ -744,6 +769,10 @@ public sealed class MainForm : Form
 
     private async Task SelectChampionAsync(Champion champion)
     {
+        if (_selectedChampion?.Id != champion.Id)
+            CancelActiveApplyForSelection(
+                $"用户切换英雄，取消当前应用：newChampionId={champion.Id}",
+                "已取消上一个应用，可以选择新英雄或皮肤");
         _selectedChampion = champion;
         _skinPage = 0;
         var rememberedSkinId = _selectionMemory.GetSkinId(champion.Id);
@@ -768,6 +797,9 @@ public sealed class MainForm : Form
         var pageCount = Math.Max(1, (int)Math.Ceiling(groups.Count / (double)SkinPageSize));
         _skinPage = Math.Clamp(_skinPage, 0, pageCount - 1);
         var page = groups.Skip(_skinPage * SkinPageSize).Take(SkinPageSize).ToList();
+        var showPager = SkinPagingPolicy.ShouldShowPager(groups.Count, SkinPageSize);
+        _skinPager.Visible = showPager;
+        _catalogLayout.RowStyles[3].Height = showPager ? 38 : 0;
         _skinCount.Text = $"{groups.Count:N0} 张基础皮肤";
         _pageLabel.Text = groups.Count == 0 ? "无结果" : $"{_skinPage + 1} / {pageCount}";
         _prevPageButton.Enabled = _skinPage > 0;
@@ -980,11 +1012,13 @@ public sealed class MainForm : Form
                 AppLog.Info(
                     $"客户端英雄同步已接受：source={source} championId={championId} champion={champion.Name} " +
                     $"skinId={normalizedSkinId} phase={selection?.Phase} samples={observation.ConsecutiveSamples}");
-                // Applying a remembered skin is deliberately detached from
-                // the polling loop. A slow download or engine request must
-                // never prevent the next champion selection from being read.
-                QueueRememberedSelectionApply(championId);
             }
+            // Applying a remembered skin is deliberately detached from the
+            // polling loop. A slow download or engine request must never
+            // prevent the next champion selection from being read. Queue once
+            // for every stabilized client selection, even when the UI already
+            // happens to show the same champion at startup.
+            QueueRememberedSelectionApply(championId);
         }
         catch (OperationCanceledException) { }
         catch (HttpRequestException ex)
@@ -1036,10 +1070,27 @@ public sealed class MainForm : Form
 
     private void SelectSkin(Skin skin, bool remember = true)
     {
+        if (_selectedSkin?.Id != skin.Id)
+            CancelActiveApplyForSelection(
+                $"用户切换皮肤，取消当前应用：newSkinId={skin.Id}",
+                "已取消上一个应用，可以应用新选择的皮肤");
         _selectedSkin = skin;
         if (remember && _selectedChampion is not null) _selectionMemory.Remember(_selectedChampion.Id, skin.Id);
         foreach (var card in _skinGrid.Controls.OfType<SkinCard>()) card.Selected = card.ContainsSkin(skin.Id);
         RenderSelectedSkin();
+    }
+
+    private void CancelActiveApplyForSelection(string logMessage, string statusMessage)
+    {
+        if (Volatile.Read(ref _applyInFlight) == 0 || !_applyOperations.Cancel()) return;
+        Interlocked.Exchange(ref _applyInFlight, 0);
+        AppLog.Info(logMessage);
+        if (!IsDisposed)
+        {
+            _applyProgress.Visible = false;
+            _applyButton.Enabled = _engine.IsReady && _selectedSkin is not null;
+            SetStatus(_applyStatus, statusMessage, Palette.Muted);
+        }
     }
 
     private async Task AutoApplyRememberedSelectionAsync(int? clientChampionId = null)
@@ -1047,21 +1098,43 @@ public sealed class MainForm : Form
         if (!_engine.IsReady) return;
 
         var championId = clientChampionId ?? (_lastClientChampionId > 0 ? _lastClientChampionId : _selectionMemory.LastChampionId);
-        if (championId <= 0 || !_autoApplyAttemptedChampions.Add(championId)) return;
+        if (championId <= 0) return;
         var skinId = _selectionMemory.GetSkinId(championId);
         if (skinId is null) return;
-        if (!_clientSelectionPollCompleted || (_lastClientChampionId > 0 && _lastClientChampionId != championId)) return;
+        if (!_clientSelectionPollCompleted || (_lastClientChampionId > 0 && _lastClientChampionId != championId))
+        {
+            AppLog.InfoThrottled(
+                $"remembered-wait-{championId}",
+                $"自动应用等待前置条件：championId={championId} pollCompleted={_clientSelectionPollCompleted} lastClientChampionId={_lastClientChampionId}",
+                TimeSpan.FromSeconds(10));
+            return;
+        }
 
         var champion = _champions.FirstOrDefault(item => item.Id == championId);
         var skin = champion?.Skins.FirstOrDefault(item => item.Id == skinId.Value);
-        if (champion is null || skin is null) return;
-        if (_selectedChampion?.Id != champion.Id) await SelectChampionAsync(champion);
-        SelectSkin(skin, remember: false);
-        if (_repository.GetCachedSkinPath(skin.Id) is null)
+        if (champion is null || skin is null)
         {
-            SetStatus(_applyStatus, "已恢复上次选择 · 本地资源未缓存，请手动应用", Palette.Muted);
+            AppLog.Warn($"自动应用跳过：记忆皮肤不在当前目录 championId={championId} skinId={skinId.Value}");
             return;
         }
+        if (_selectedChampion?.Id != champion.Id) await SelectChampionAsync(champion);
+        SelectSkin(skin, remember: false);
+        var cached = _repository.GetCachedSkinPath(skin.Id);
+        if (!RememberedSelectionPolicy.CanAttempt(
+                _engine.IsReady,
+                _clientSelectionPollCompleted,
+                championId,
+                skin.Id,
+                cached is not null))
+        {
+            AppLog.Info(
+                $"自动应用跳过：本地缓存不存在或前置条件未完成 championId={championId} skinId={skin.Id} " +
+                $"engineReady={_engine.IsReady} pollCompleted={_clientSelectionPollCompleted} " +
+                $"repositoryReady={_repository.IsReady} cachedPath={cached ?? "<none>"}");
+            SetStatus(_applyStatus, "已恢复上次选择 · 本地资源未缓存，请点击应用下载", Palette.Muted);
+            return;
+        }
+        if (!_autoApplyAttemptedChampions.Add(championId)) return;
         SetStatus(_applyStatus, "正在自动应用上次选择的皮肤", Palette.Muted);
         await ApplySelectedSkinAsync(downloadIfMissing: false);
     }
@@ -1186,22 +1259,72 @@ public sealed class MainForm : Form
         var skin = _selectedSkin;
         if (skin is null || !_engine.IsReady) return;
         if (Interlocked.Exchange(ref _applyInFlight, 1) != 0) return;
+        var operationToken = _applyOperations.Begin(_lifetime.Token);
         AppLog.Info($"收到皮肤应用请求：skinId={skin.Id} repositoryReady={_repository.IsReady} "
             + $"repositorySyncing={_repository.IsSyncing} downloadIfMissing={downloadIfMissing}");
         _applyButton.Enabled = false;
         _applyProgress.Visible = true;
-        SetStatus(_applyStatus, $"正在缓存 {skin.Id}", Palette.Muted);
+        SetStatus(_applyStatus, $"正在准备皮肤 {skin.Id}", Palette.Muted);
         try
         {
             if (!_repository.IsReady)
             {
                 SetStatus(_applyStatus, "正在加载随包资源索引", Palette.Muted);
-                if (!await _repository.EnsureIndexReadyAsync(_lifetime.Token))
+                var indexReady = await ApplyOperationPolicy.RunWithTimeoutAsync(
+                    token => _repository.EnsureIndexReadyAsync(token),
+                    operationToken,
+                    ApplyOperationPhase.Cache);
+                if (!indexReady)
                     throw new InvalidOperationException("随包资源索引不可用，请检查程序文件后重试");
             }
-            var cached = downloadIfMissing
-                ? await _repository.EnsureSkinCachedAsync(skin.Id, _lifetime.Token)
-                : _repository.GetCachedSkinPath(skin.Id);
+            var cached = _repository.GetCachedSkinPath(skin.Id);
+            if (downloadIfMissing && cached is null)
+            {
+                SetStatus(_applyStatus, $"正在探测资源（最长 5 秒）", Palette.Muted);
+                SkinResourceProbeResult probe;
+                try
+                {
+                    probe = await ApplyOperationPolicy.RunWithTimeoutAsync(
+                        token => _repository.ProbeSkinAvailabilityAsync(skin.Id, token),
+                        operationToken,
+                        ApplyOperationPhase.AvailabilityProbe);
+                }
+                catch (TimeoutException ex)
+                {
+                    AppLog.Warn($"资源可下载探测超时：skinId={skin.Id} detail={ex.Message}");
+                    throw new InvalidOperationException("资源不可用，应用失败，请重新应用或检查网络和授权状态");
+                }
+
+                if (!probe.Available && AuthorizationService.IsEnabled && (probe.StatusCode is 401 or 403))
+                {
+                    AppLog.Warn($"资源探测被授权服务拒绝，尝试刷新本地租约一次：skinId={skin.Id} endpoint={probe.Endpoint ?? "<none>"} status={probe.StatusCode}");
+                    var refreshed = await _authorization.RestoreAsync(operationToken);
+                    AppLog.Info($"资源授权刷新结果：skinId={skin.Id} allowed={refreshed.Allowed} offline={refreshed.Offline} code={refreshed.ErrorCode}");
+                    if (refreshed.Allowed)
+                    {
+                        probe = await ApplyOperationPolicy.RunWithTimeoutAsync(
+                            token => _repository.ProbeSkinAvailabilityAsync(skin.Id, token),
+                            operationToken,
+                            ApplyOperationPhase.AvailabilityProbe);
+                    }
+                    else if (!string.IsNullOrWhiteSpace(refreshed.Message))
+                    {
+                        probe = probe with { Reason = refreshed.Message };
+                    }
+                }
+
+                if (!probe.Available)
+                {
+                    AppLog.Warn($"资源不可用，拒绝开始下载：skinId={skin.Id} reason={probe.Reason} endpoint={probe.Endpoint ?? "<none>"} status={probe.StatusCode?.ToString() ?? "<none>"}");
+                    throw new InvalidOperationException($"资源不可用，应用失败：{probe.Reason}");
+                }
+
+                SetStatus(_applyStatus, $"正在下载 {skin.Id}（最长 15 秒）", Palette.Muted);
+                cached = await ApplyOperationPolicy.RunWithTimeoutAsync(
+                    token => _repository.EnsureSkinCachedAsync(skin.Id, token),
+                    operationToken,
+                    ApplyOperationPhase.Download);
+            }
             if (!downloadIfMissing && cached is null)
             {
                 SetStatus(_applyStatus, "本地资源未缓存，请点击应用皮肤下载资源", Palette.Muted);
@@ -1209,7 +1332,7 @@ public sealed class MainForm : Form
             }
             if (cached is null)
             {
-                throw new InvalidOperationException($"远程仓库中未找到皮肤 {skin.Id}");
+                throw new InvalidOperationException($"皮肤资源下载失败，应用失败：{skin.Id}。请重新打开软件或重新应用");
             }
             AppLog.Info($"皮肤缓存已确认：skinId={skin.Id} path={cached} engineRoot={_engine.PortableRoot} repository={_repository.RepositoryPath}");
             var targetSkinId = ApplicationTargetSkinId(skin);
@@ -1222,21 +1345,29 @@ public sealed class MainForm : Form
                 SetStatus(_applyStatus, "皮肤已应用 · 无需重复处理", Palette.Success);
                 return;
             }
-            var result = await _engine.ApplyAsync(skin.Id, _lifetime.Token, targetSkinId);
-            if (result is null || !result.Ok)
-            {
-                // A newly cached file may not be in the engine catalog yet.
-                // Rebuild only for that specific error; mod-tools failures
-                // must surface immediately instead of entering another retry
-                // cycle.
-                if (IsCatalogMiss(result?.Error))
+            SetStatus(_applyStatus, "正在提交引擎应用（最长 5 秒）", Palette.Muted);
+            var result = await ApplyOperationPolicy.RunWithTimeoutAsync(
+                async token =>
                 {
-                    SetStatus(_applyStatus, "正在刷新本地索引并重试", Palette.Muted);
-                    var rebuild = await _engine.RebuildAsync(_lifetime.Token);
-                    if (rebuild is null) throw new InvalidOperationException("本地引擎无法重建索引");
-                    result = await _engine.ApplyAsync(skin.Id, _lifetime.Token, targetSkinId);
-                }
-            }
+                    var applyResult = await _engine.ApplyAsync(skin.Id, token, targetSkinId);
+                    if (applyResult is null || !applyResult.Ok)
+                    {
+                        // A newly cached file may not be in the engine catalog yet.
+                        // Rebuild only for that specific error; mod-tools failures
+                        // must surface immediately instead of entering another retry
+                        // cycle.
+                        if (IsCatalogMiss(applyResult?.Error))
+                        {
+                            SetStatus(_applyStatus, "正在刷新本地索引并重试", Palette.Muted);
+                            var rebuild = await _engine.RebuildAsync(token);
+                            if (rebuild is null) throw new InvalidOperationException("本地引擎无法重建索引");
+                            applyResult = await _engine.ApplyAsync(skin.Id, token, targetSkinId);
+                        }
+                    }
+                    return applyResult;
+                },
+                operationToken,
+                ApplyOperationPhase.Engine);
             if (result is null || !result.Ok)
                 throw new InvalidOperationException(string.IsNullOrWhiteSpace(result?.Error) ? "应用请求失败" : result.Error);
             _lastAppliedSkinId = skin.Id;
@@ -1262,6 +1393,18 @@ public sealed class MainForm : Form
                 injectionStatus.Equals("redirected", StringComparison.OrdinalIgnoreCase) || !armed
                     ? Palette.Success : Palette.Muted);
         }
+        catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
+        catch (OperationCanceledException) when (operationToken.IsCancellationRequested)
+        {
+            AppLog.Info($"皮肤应用已取消：skinId={skin.Id}");
+            if (!IsDisposed && _selectedSkin?.Id == skin.Id)
+                SetStatus(_applyStatus, "皮肤应用已取消，可以选择其他皮肤重试", Palette.Muted);
+        }
+        catch (TimeoutException ex)
+        {
+            AppLog.Error($"皮肤应用超时：skinId={skin.Id}", ex);
+            SetStatus(_applyStatus, ex.Message, Palette.Error);
+        }
         catch (Exception ex)
         {
             AppLog.Error($"皮肤应用失败：{skin.Id}", ex);
@@ -1269,9 +1412,14 @@ public sealed class MainForm : Form
         }
         finally
         {
-            _applyProgress.Visible = false;
-            _applyButton.Enabled = _engine.IsReady && _selectedSkin is not null;
-            Interlocked.Exchange(ref _applyInFlight, 0);
+            var ownsUi = _applyOperations.IsCurrent(operationToken);
+            _applyOperations.Complete(operationToken);
+            if (ownsUi)
+            {
+                _applyProgress.Visible = false;
+                _applyButton.Enabled = _engine.IsReady && _selectedSkin is not null;
+                Interlocked.Exchange(ref _applyInFlight, 0);
+            }
         }
     }
 
@@ -1322,10 +1470,15 @@ public sealed class MainForm : Form
                 }
                 var merged = _catalog.MergeRepository(_repository.SkinPaths, _repository.SkinNames, _repository.SkinEnglishNames, _repository.CachedPreviewPaths);
                 await _repository.UpdateEngineIndexAsync(_lifetime.Token);
-                if (_repository.LastSyncChanged || merged > 0)
+                if (_repository.LastSyncChanged || merged > 0 || !_catalogViewReady)
+                {
                     await RefreshCatalogViewAsync();
+                    _catalogViewReady = true;
+                }
                 var updateLabel = _repository.LastSyncChanged ? "已更新" : "已就绪";
                 SetStatus(_applyStatus, $"本地资源{updateLabel} · {_repository.RemoteSkinCount:N0} 个皮肤", Palette.Success);
+                if (_lastClientChampionId > 0)
+                    QueueRememberedSelectionApply(_lastClientChampionId);
             }
             else
             {
@@ -1398,6 +1551,7 @@ public sealed class MainForm : Form
             _clientSelectionTimer.Dispose();
             _leagueClient.Dispose();
             _engine.Dispose();
+            _applyOperations.Dispose();
             _lifetime.Dispose();
         }
         base.Dispose(disposing);

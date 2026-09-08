@@ -63,7 +63,7 @@ public sealed class AuthorizationService
         if (!clockMovedBack && stored.GraceUntil > now && IsTransient(online.ErrorCode))
             return AuthorizationAttempt.Success(stored, offline: true);
 
-        if (online.ErrorCode is "LICENSE_REVOKED" or "LICENSE_EXPIRED" or "INVALID_LEASE")
+        if (online.ErrorCode is "LICENSE_REVOKED" or "LICENSE_EXPIRED" or "INVALID_LEASE" or "LEASE_EXPIRED")
         {
             _store.Clear();
             if (online.ErrorCode is "LICENSE_REVOKED" or "LICENSE_EXPIRED") _remembered.Clear();

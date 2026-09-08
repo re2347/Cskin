@@ -8,7 +8,7 @@ v3 同一 Worker 还提供受授权租约保护的私有皮肤接口：
 
 GitCode 访问令牌必须通过 `npx wrangler secret put GITCODE_TOKEN` 配置，禁止
 写入 `wrangler.jsonc`、`.dev.vars` 的提交版本或客户端。索引更新流程见
-`../../V3-PRIVATE-REPOSITORY.md`。
+[`../../../修复文档汇总.md`](../../../修复文档汇总.md)。
 
 迁移 `0005_private_skin_catalog_state.sql` 保存动态目录 revision 和覆盖项。
 Worker 每五分钟通过 branch/compare API 增量刷新，因此日常更新 GitCode 仓库后

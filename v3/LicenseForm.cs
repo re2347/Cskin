@@ -115,7 +115,7 @@ internal sealed class LicenseForm : Form
         // protected key once. Do not do this for network errors, which should
         // use the existing offline grace period instead.
         if (!result.Allowed && !string.IsNullOrWhiteSpace(remembered)
-            && (result.ErrorCode is "NO_LOCAL_LEASE" or "DEVICE_CHANGED" or "INVALID_SIGNATURE" or "INVALID_LEASE" or "DEVICE_KEY_CHANGED"
+            && (result.ErrorCode is "NO_LOCAL_LEASE" or "DEVICE_CHANGED" or "INVALID_SIGNATURE" or "INVALID_LEASE" or "LEASE_EXPIRED" or "DEVICE_KEY_CHANGED"
                 || result.Message.StartsWith("尚未激活", StringComparison.Ordinal)
                 || result.Message.StartsWith("设备信息已变化", StringComparison.Ordinal)))
         {
