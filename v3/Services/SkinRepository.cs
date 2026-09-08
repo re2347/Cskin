@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.IO.Compression;
 using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -53,6 +54,8 @@ public sealed class SkinRepository
     public IReadOnlyDictionary<int, string> SkinNames => _names;
     public IReadOnlyDictionary<int, string> SkinEnglishNames => _englishNames;
     public IReadOnlyDictionary<int, string> CachedPreviewPaths => _previewPaths;
+
+    public static string AvailabilityPath(int skinId) => $"v1/skins/availability?skinId={skinId}";
 
     public void SetPortableRoot(string? portableRoot) => _portableRoot = portableRoot;
 
@@ -234,76 +237,140 @@ public sealed class SkinRepository
         if (!TryGetRemotePath(skinId, out var relativePath))
             return new(false, $"私有资源索引中没有皮肤 {skinId}");
 
-        var expectedBlobSha = _blobShas.GetValueOrDefault(skinId);
-        SkinResourceProbeResult? lastAuthorizationFailure = null;
-        foreach (var endpoint in ResourceEndpoints)
+        var cachedPath = GetCachedSkinPath(skinId);
+        if (SkinCachePolicy.CanSkipAvailabilityProbe(cachedPath is not null))
         {
-            cancellationToken.ThrowIfCancellationRequested();
-            var started = Environment.TickCount64;
-            try
-            {
-                using var request = new HttpRequestMessage(
-                    HttpMethod.Get,
-                    new Uri(endpoint.BaseUrl, "v1/skins/file?skinId=" + skinId));
-                if (!AddLeaseHeaders(request))
-                {
-                    AppLog.Warn($"资源可下载探测缺少有效授权租约：skinId={skinId}");
-                    return new(false, "缺少有效授权租约");
-                }
-
-                using var response = await RepositoryHttp.SendAsync(
-                    request,
-                    HttpCompletionOption.ResponseHeadersRead,
-                    cancellationToken);
-                var gateway = Header(response, "X-Cskin-Gateway");
-                var upstream = Header(response, "X-Cskin-Upstream");
-                var revision = Header(response, "X-Cskin-Revision");
-                var blobSha = Header(response, "X-Cskin-Blob-Sha");
-                if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
-                {
-                    var remoteError = await ReadRemoteErrorAsync(response, cancellationToken);
-                    var tryNext = ResourceAuthorizationPolicy.ShouldTryNext(response.StatusCode, remoteError.Code);
-                    var reason = ResourceAuthorizationPolicy.Describe(response.StatusCode, remoteError.Code, remoteError.Message);
-                    lastAuthorizationFailure = new(false, reason, endpoint.BaseUrl.Host, (int)response.StatusCode);
-                    AppLog.Warn($"资源可下载探测授权被拒绝：skinId={skinId} endpoint={endpoint.BaseUrl.Host} status={(int)response.StatusCode} code={remoteError.Code} message={remoteError.Message} failover={tryNext}");
-                    if (tryNext) continue;
-                    return lastAuthorizationFailure;
-                }
-                if (!response.IsSuccessStatusCode)
-                {
-                    var transient = IsTransientStatus(response.StatusCode);
-                    AppLog.Warn($"资源可下载探测请求失败：skinId={skinId} endpoint={endpoint.BaseUrl.Host} status={(int)response.StatusCode} transient={transient} path={relativePath}");
-                    if (transient) continue;
-                    return new(false, $"资源不存在或不可下载（HTTP {(int)response.StatusCode}）", endpoint.BaseUrl.Host, (int)response.StatusCode);
-                }
-
-                var contentLength = response.Content.Headers.ContentLength;
-                if (contentLength is 0)
-                {
-                    AppLog.Warn($"资源可下载探测返回空内容：skinId={skinId} endpoint={endpoint.BaseUrl.Host}");
-                    continue;
-                }
-                if (!string.Equals(gateway, endpoint.Gateway, StringComparison.OrdinalIgnoreCase)
-                    || !string.Equals(upstream, "gitcode", StringComparison.OrdinalIgnoreCase)
-                    || string.IsNullOrWhiteSpace(revision)
-                    || (!string.IsNullOrWhiteSpace(_revision) && !string.Equals(revision, _revision, StringComparison.OrdinalIgnoreCase))
-                    || (IsGitObjectId(expectedBlobSha) && !string.Equals(blobSha, expectedBlobSha, StringComparison.OrdinalIgnoreCase)))
-                {
-                    AppLog.Warn($"资源可下载探测响应校验失败，切换下一通道：skinId={skinId} endpoint={endpoint.BaseUrl.Host} gateway={gateway} upstream={upstream} revision={ShortRevision(revision)} expectedRevision={ShortRevision(_revision)} blob={ShortRevision(blobSha)} expectedBlob={ShortRevision(expectedBlobSha)}");
-                    continue;
-                }
-
-                AppLog.Info($"资源可下载探测成功：skinId={skinId} endpoint={endpoint.BaseUrl.Host} status={(int)response.StatusCode} contentLength={contentLength?.ToString() ?? "chunked"} elapsedMs={Environment.TickCount64 - started} path={relativePath}");
-                return new(true, "ok", endpoint.BaseUrl.Host, (int)response.StatusCode);
-            }
-            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
-            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException)
-            {
-                AppLog.Warn($"资源可下载探测临时异常，切换下一通道：skinId={skinId} endpoint={endpoint.BaseUrl.Host} elapsedMs={Environment.TickCount64 - started} error={ex.Message}");
-            }
+            AppLog.Info($"资源可用性探测跳过：skinId={skinId} reason=trusted-local-cache path={cachedPath} revision={ShortRevision(_revision)}");
+            return new(true, "trusted-local-cache", "local-cache", 200);
         }
 
-        return lastAuthorizationFailure ?? new(false, "所有安全资源通道均不可用");
+        var expectedBlobSha = _blobShas.GetValueOrDefault(skinId);
+        var endpoints = ResourceEndpoints.Select(endpoint => endpoint.BaseUrl.Host).ToArray();
+        var batch = await ResourceProbePolicy.ProbeInParallelAsync(
+            endpoints,
+            (host, token) => ProbeGatewayAsync(
+                ResourceEndpoints.First(endpoint => string.Equals(endpoint.BaseUrl.Host, host, StringComparison.OrdinalIgnoreCase)),
+                skinId,
+                relativePath,
+                expectedBlobSha,
+                token),
+            cancellationToken).ConfigureAwait(false);
+
+        cancellationToken.ThrowIfCancellationRequested();
+        foreach (var attempt in batch.Attempts)
+        {
+            var message = $"资源可用性探测通道结果：skinId={skinId} endpoint={attempt.Endpoint} available={attempt.Result.Available} reason={attempt.Result.Reason} status={attempt.Result.StatusCode?.ToString() ?? "<none>"} dnsMs={attempt.DnsMilliseconds} connectHttpMs={attempt.ConnectHttpMilliseconds} elapsedMs={attempt.ElapsedMilliseconds} detail={attempt.Detail}";
+            if (attempt.Result.Available) AppLog.Info(message);
+            else AppLog.Warn(message);
+        }
+
+        if (batch.Winner is not null) return batch.Winner.Result;
+        var authorizationFailure = batch.Attempts.LastOrDefault(attempt => attempt.Result.StatusCode is 401 or 403);
+        if (authorizationFailure is not null) return authorizationFailure.Result;
+        var definitiveFailure = batch.Attempts.FirstOrDefault(attempt =>
+            attempt.Result.StatusCode is int status && !IsTransientStatus((HttpStatusCode)status));
+        return definitiveFailure?.Result ?? new(false, "所有安全资源通道均不可用");
+    }
+
+    private async Task<ResourceProbeAttempt> ProbeGatewayAsync(
+        ResourceEndpoint endpoint,
+        int skinId,
+        string relativePath,
+        string? expectedBlobSha,
+        CancellationToken cancellationToken)
+    {
+        var started = Environment.TickCount64;
+        var dnsMilliseconds = 0L;
+        var connectHttpMilliseconds = 0L;
+        int? statusCode = null;
+
+        ResourceProbeAttempt Build(SkinResourceProbeResult result, string detail = "") => new(
+            endpoint.BaseUrl.Host,
+            result,
+            dnsMilliseconds,
+            connectHttpMilliseconds,
+            Environment.TickCount64 - started,
+            detail);
+
+        try
+        {
+            using var request = new HttpRequestMessage(
+                HttpMethod.Get,
+                new Uri(endpoint.BaseUrl, AvailabilityPath(skinId)));
+            if (!AddLeaseHeaders(request))
+                return Build(new(false, "缺少有效授权租约", endpoint.BaseUrl.Host), "lease headers unavailable");
+
+            var dnsStarted = Environment.TickCount64;
+            try
+            {
+                var addresses = await System.Net.Dns.GetHostAddressesAsync(
+                    endpoint.BaseUrl.Host,
+                    System.Net.Sockets.AddressFamily.Unspecified,
+                    cancellationToken).ConfigureAwait(false);
+                dnsMilliseconds = Environment.TickCount64 - dnsStarted;
+                AppLog.Info($"资源可用性探测 DNS：skinId={skinId} endpoint={endpoint.BaseUrl.Host} addresses={addresses.Length} dnsMs={dnsMilliseconds}");
+            }
+            catch (Exception ex) when (ex is SocketException or ArgumentException or IOException)
+            {
+                dnsMilliseconds = Environment.TickCount64 - dnsStarted;
+                return Build(new(false, "网关 DNS 解析失败", endpoint.BaseUrl.Host), ex.Message);
+            }
+
+            var requestStarted = Environment.TickCount64;
+            using var response = await RepositoryHttp.SendAsync(
+                request,
+                HttpCompletionOption.ResponseHeadersRead,
+                cancellationToken).ConfigureAwait(false);
+            connectHttpMilliseconds = Environment.TickCount64 - requestStarted;
+            statusCode = (int)response.StatusCode;
+            AppLog.Info($"资源可用性探测 HTTP 响应：skinId={skinId} endpoint={endpoint.BaseUrl.Host} status={statusCode} connectHttpMs={connectHttpMilliseconds} elapsedMs={Environment.TickCount64 - started}");
+
+            var gateway = Header(response, "X-Cskin-Gateway");
+            var upstream = Header(response, "X-Cskin-Upstream");
+            var revision = Header(response, "X-Cskin-Revision");
+            if (response.StatusCode is HttpStatusCode.Unauthorized or HttpStatusCode.Forbidden)
+            {
+                var remoteError = await ReadRemoteErrorAsync(response, cancellationToken).ConfigureAwait(false);
+                var reason = ResourceAuthorizationPolicy.Describe(response.StatusCode, remoteError.Code, remoteError.Message);
+                return Build(new(false, reason, endpoint.BaseUrl.Host, statusCode), $"code={remoteError.Code} message={remoteError.Message}");
+            }
+            if (!response.IsSuccessStatusCode)
+            {
+                var transient = IsTransientStatus(response.StatusCode);
+                return Build(new(false, $"资源不存在或不可下载（HTTP {statusCode}）", endpoint.BaseUrl.Host, statusCode), $"transient={transient} path={relativePath}");
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            var availability = await JsonSerializer.DeserializeAsync<SkinAvailability>(stream, JsonOptions, cancellationToken).ConfigureAwait(false);
+            if (availability is null || !availability.Available || availability.SkinId != skinId
+                || !TryNormalizeSkinPath(availability.Path, skinId, out var remotePath)
+                || !string.Equals(remotePath, relativePath, StringComparison.OrdinalIgnoreCase))
+            {
+                return Build(new(false, "资源可用性探测响应无效", endpoint.BaseUrl.Host, statusCode), $"available={availability?.Available} path={availability?.Path}");
+            }
+
+            var responseBlobSha = Header(response, "X-Cskin-Blob-Sha");
+            if (string.IsNullOrWhiteSpace(responseBlobSha)) responseBlobSha = availability.BlobSha ?? "";
+            if (!string.Equals(gateway, endpoint.Gateway, StringComparison.OrdinalIgnoreCase)
+                || !string.Equals(upstream, "gitcode", StringComparison.OrdinalIgnoreCase)
+                || string.IsNullOrWhiteSpace(revision)
+                || (!string.IsNullOrWhiteSpace(_revision) && !string.Equals(revision, _revision, StringComparison.OrdinalIgnoreCase))
+                || (IsGitObjectId(expectedBlobSha) && !string.Equals(responseBlobSha, expectedBlobSha, StringComparison.OrdinalIgnoreCase)))
+            {
+                return Build(new(false, "资源可用性探测响应校验失败", endpoint.BaseUrl.Host, statusCode),
+                    $"gateway={gateway} upstream={upstream} revision={ShortRevision(revision)} expectedRevision={ShortRevision(_revision)} blob={ShortRevision(responseBlobSha)} expectedBlob={ShortRevision(expectedBlobSha)}");
+            }
+
+            return Build(new(true, "ok", endpoint.BaseUrl.Host, statusCode), $"path={relativePath}");
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            return Build(new(false, "资源探测超时", endpoint.BaseUrl.Host, statusCode), "request canceled by five-second probe budget");
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or IOException or JsonException)
+        {
+            return Build(new(false, "资源探测请求异常", endpoint.BaseUrl.Host, statusCode), ex.Message);
+        }
     }
 
     public async Task<string?> EnsureSkinCachedAsync(int skinId, CancellationToken cancellationToken = default)
@@ -842,6 +909,15 @@ public sealed class SkinRepository
     private sealed record ResourceEndpoint(string Gateway, Uri BaseUrl);
 
     private sealed record RemoteError(string Code, string Message);
+
+    private sealed class SkinAvailability
+    {
+        public bool Available { get; set; }
+        public int SkinId { get; set; }
+        public string Path { get; set; } = "";
+        public string? Revision { get; set; }
+        public string? BlobSha { get; set; }
+    }
 
     private sealed record DownloadedIndex(WorkerIndex Index, string Gateway, string Upstream, string Endpoint);
 

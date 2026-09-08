@@ -14,7 +14,7 @@ public sealed class UpdateManifest
     public string Channel { get; set; } = "stable";
 
     [JsonPropertyName("latestVersion")]
-    public string LatestVersion { get; set; } = "0.4.0";
+    public string LatestVersion { get; set; } = "0.4.1";
 
     [JsonPropertyName("minimumVersion")]
     public string MinimumVersion { get; set; } = "0.4.0";

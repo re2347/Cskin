@@ -2,7 +2,7 @@ namespace CskinNative.Services;
 
 public static class UpdatePolicy
 {
-    public const string CurrentVersionText = "0.4.0";
+    public const string CurrentVersionText = "0.4.1";
 
     public static UpdateGateDecision Evaluate(string? currentVersion, UpdateManifest? manifest)
     {

@@ -29,7 +29,7 @@ public sealed class UpdateClient : IDisposable
             {
                 var baseUri = new Uri(endpoint.TrimEnd('/') + "/", UriKind.Absolute);
                 using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(baseUri, "v1/client/version"));
-                request.Headers.UserAgent.ParseAdd("PortableCskin/0.4.0");
+                request.Headers.UserAgent.ParseAdd("PortableCskin/0.4.1");
                 using var response = await _http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, overall.Token).ConfigureAwait(false);
                 var body = await response.Content.ReadAsStringAsync(overall.Token).ConfigureAwait(false);
                 if (!response.IsSuccessStatusCode)
